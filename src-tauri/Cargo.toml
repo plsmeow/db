@@ -1,0 +1,202 @@
+[package]
+name = "donutbrowser"
+version = "0.29.5"
+description = "Simple Yet Powerful Anti-Detect Browser"
+authors = ["zhom@github"]
+edition = "2021"
+default-run = "donutbrowser"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "donutbrowser_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
+
+[[bin]]
+name = "donutbrowser"
+path = "src/main.rs"
+
+[[bin]]
+name = "donut-proxy"
+path = "src/bin/proxy_server.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+resvg = "0.47"
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-macos-permissions = "2"
+tauri-plugin-log = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-window-state = "2"
+log = "0.4"
+env_logger = "0.11"
+
+directories = "6"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "stream", "socks", "charset", "http2", "system-proxy"] }
+tokio = { version = "1", features = ["full", "sync"] }
+tokio-util = "0.7"
+sysinfo = "0.39"
+lazy_static = "1.5"
+base64 = "0.22"
+libc = "0.2"
+async-trait = "0.1"
+futures-util = "0.3"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+tar = "0"
+bzip2 = "0"
+flate2 = "1"
+lzma-rs = "0"
+msi-extract = "0"
+
+uuid = { version = "1.23", features = ["v4", "serde"] }
+url = "2.5"
+blake3 = "1"
+globset = "0.4"
+mime_guess = "2"
+once_cell = "1"
+urlencoding = "2.1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+axum = { version = "0.8.9", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors"] }
+rand = "0.10.2"
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa-axum = "0.2"
+argon2 = "0.5"
+aes-gcm = "0.11"
+aes = "0.9"
+cbc = "0.2"
+ring = "0.17"
+subtle = "2"
+sha2 = "0.11"
+shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher"] }
+hyper = { version = "1.10", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+clap = { version = "4", features = ["derive"] }
+async-socks5 = "0.6"
+
+
+# Wayfern CDP integration
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_yaml = "0.9"
+toml = "1.1"
+thiserror = "2.0"
+regex-lite = "0.1"
+tempfile = "3"
+maxminddb = "0.29"
+quick-xml = { version = "0.41", features = ["serialize"] }
+
+# VPN support
+boringtun = "0.7"
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dns"] }
+
+# Tray icon decoding (main-process system tray)
+image = "0.25"
+dirs = "6"
+crossbeam-channel = "0.5"
+sys-locale = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+
+# Reading the desktop's titlebar button layout for the in-app window controls.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+# Reading the source browser's "<Brand> Safe Storage" secret during profile
+# import, so its cookies and passwords can be re-encrypted for Wayfern.
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+# Reading the source browser's "<Brand> Safe Storage" Keychain item during
+# profile import, so its cookies and passwords can be re-encrypted for Wayfern.
+security-framework = "3"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.56"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_SystemInformation",
+  "Win32_System_IO",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Registry",
+  "Win32_UI_Shell",
+  # CryptUnprotectData, for unwrapping the source browser's os_crypt key from
+  # `Local State` during profile import.
+  "Win32_Security_Cryptography",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6"
+hyper = { version = "1.10", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+futures-util = "0.3"
+serial_test = "3"
+
+# Integration test configuration
+[[test]]
+name = "donut_proxy_integration"
+path = "tests/donut_proxy_integration.rs"
+
+[[test]]
+name = "sync_e2e"
+path = "tests/sync_e2e.rs"
+
+[[test]]
+name = "vpn_integration"
+path = "tests/vpn_integration.rs"
+
+[profile.dev]
+codegen-units = 256
+incremental = true
+opt-level = 0
+# Split debuginfo on macOS for faster linking (ignored on other platforms)
+split-debuginfo = "unpacked"
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = "thin"
+# Split debuginfo on macOS for faster linking (ignored on other platforms)
+split-debuginfo = "unpacked"
+
+[profile.test]
+# Optimize test builds for faster compilation
+codegen-units = 256
+incremental = true
+
+[features]
+# by default Tauri runs in production mode
+# when `tauri dev` runs it is executed with `cargo run --no-default-features` if `devPath` points to the filesystem
+default = ["custom-protocol"]
+# this feature is used used for production builds where `devPath` points to the filesystem
+# DO NOT remove this
+custom-protocol = ["tauri/custom-protocol"]
+e2e = []

@@ -1,0 +1,993 @@
+use crate::browser_version_manager::{BrowserVersionInfo, BrowserVersionManager};
+use crate::profile::{BrowserProfile, ProfileManager};
+use crate::settings_manager::SettingsManager;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateNotification {
+  pub id: String,
+  pub browser: String,
+  pub current_version: String,
+  pub new_version: String,
+  pub affected_profiles: Vec<String>,
+  pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AutoUpdateState {
+  pub pending_updates: Vec<UpdateNotification>,
+  pub disabled_browsers: HashSet<String>, // browsers disabled during update
+  #[serde(default)]
+  pub auto_update_downloads: HashSet<String>, // track auto-update downloads for toast suppression
+  pub last_check_timestamp: u64,
+}
+
+pub struct AutoUpdater {
+  browser_version_manager: &'static BrowserVersionManager,
+  settings_manager: &'static SettingsManager,
+  profile_manager: &'static ProfileManager,
+}
+
+impl AutoUpdater {
+  fn new() -> Self {
+    Self {
+      browser_version_manager: BrowserVersionManager::instance(),
+      settings_manager: SettingsManager::instance(),
+      profile_manager: ProfileManager::instance(),
+    }
+  }
+
+  pub fn instance() -> &'static AutoUpdater {
+    &AUTO_UPDATER
+  }
+
+  /// Check for updates for all profiles
+  pub async fn check_for_updates(
+    &self,
+  ) -> Result<Vec<UpdateNotification>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut notifications = Vec::new();
+    let mut browser_versions: HashMap<String, Vec<BrowserVersionInfo>> = HashMap::new();
+
+    // Group profiles by browser
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles: {e}"))?;
+    let mut browser_profiles: HashMap<String, Vec<BrowserProfile>> = HashMap::new();
+
+    for profile in profiles {
+      if profile.is_cross_os() {
+        continue;
+      }
+
+      // Only check supported browsers
+      if !self
+        .browser_version_manager
+        .is_browser_supported(&profile.browser)
+        .unwrap_or(false)
+      {
+        continue;
+      }
+
+      browser_profiles
+        .entry(profile.browser.clone())
+        .or_default()
+        .push(profile);
+    }
+
+    for (browser, profiles) in browser_profiles {
+      // Always fetch fresh versions for update checks — stale cache would miss new releases
+      let versions = match self
+        .browser_version_manager
+        .fetch_browser_versions_detailed(&browser, false)
+        .await
+      {
+        Ok(versions) => versions,
+        Err(e) => {
+          log::warn!("Failed to fetch versions for {browser}: {e}, trying cache");
+          // Fall back to cache if network fails
+          if let Some(cached) = self
+            .browser_version_manager
+            .get_cached_browser_versions_detailed(&browser)
+          {
+            cached
+          } else {
+            continue;
+          }
+        }
+      };
+
+      browser_versions.insert(browser.clone(), versions.clone());
+
+      // Check each profile for updates
+      for profile in profiles {
+        if let Some(update) = self.check_profile_update(&profile, &versions)? {
+          notifications.push(update);
+        }
+      }
+    }
+
+    Ok(notifications)
+  }
+
+  pub async fn check_for_updates_with_progress(&self, app_handle: &tauri::AppHandle) {
+    log::info!("Starting auto-update check with progress...");
+
+    // Browser auto-updates are always enabled — the disable_auto_updates setting
+    // only controls app self-updates, not browser version updates.
+
+    // Check for browser updates and trigger auto-downloads
+    match self.check_for_updates().await {
+      Ok(update_notifications) => {
+        // Group by browser+version to avoid duplicate downloads
+        let grouped = self.group_update_notifications(update_notifications);
+        if !grouped.is_empty() {
+          log::info!("Found {} browser updates", grouped.len());
+
+          for notification in grouped {
+            log::info!(
+              "Auto-updating {} to version {} ({} profiles)",
+              notification.browser,
+              notification.new_version,
+              notification.affected_profiles.len()
+            );
+
+            let browser = notification.browser.clone();
+            let new_version = notification.new_version.clone();
+            let app_handle_clone = app_handle.clone();
+
+            // Spawn async task to handle the download and auto-update
+            tokio::spawn(async move {
+              let registry =
+                crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+
+              // Skip if this browser-version pair is already being downloaded
+              if crate::downloader::is_downloading(&browser, &new_version) {
+                log::info!(
+                  "Browser {browser} {new_version} is already being downloaded, skipping duplicate"
+                );
+                return;
+              }
+
+              if registry.is_browser_downloaded(&browser, &new_version) {
+                log::info!("Browser {browser} {new_version} already downloaded, proceeding to auto-update profiles");
+
+                // Browser already exists, go straight to profile update
+                match AutoUpdater::instance()
+                  .auto_update_profile_versions(&app_handle_clone, &browser, &new_version)
+                  .await
+                {
+                  Ok(updated_profiles) => {
+                    if !updated_profiles.is_empty() {
+                      log::info!(
+                        "Auto-updated {} profiles to {browser} {new_version}: {:?}",
+                        updated_profiles.len(),
+                        updated_profiles
+                      );
+                    }
+                  }
+                  Err(e) => {
+                    log::error!("Failed to auto-update profiles for {browser}: {e}");
+                  }
+                }
+              } else {
+                log::info!("Downloading browser {browser} version {new_version}...");
+
+                // Download directly from Rust — download_browser_full already
+                // auto-updates non-running profiles after successful download.
+                match crate::downloader::download_browser(
+                  app_handle_clone,
+                  browser.clone(),
+                  new_version.clone(),
+                )
+                .await
+                {
+                  Ok(actual_version) => {
+                    log::info!("Auto-download completed for {browser} {actual_version}");
+                  }
+                  Err(e) => {
+                    log::error!("Failed to auto-download {browser} {new_version}: {e}");
+                  }
+                }
+              }
+            });
+          }
+        } else {
+          log::info!("No browser updates needed");
+        }
+      }
+      Err(e) => {
+        log::error!("Failed to check for browser updates: {e}");
+      }
+    }
+
+    // Also update any profiles that can be bumped to an already-installed newer version.
+    // This handles cases where a version was downloaded but profiles weren't updated
+    // (e.g., they were running at the time, or the update was missed).
+    match self.update_profiles_to_latest_installed(app_handle) {
+      Ok(updated) => {
+        if !updated.is_empty() {
+          log::info!(
+            "Updated {} profiles to latest installed versions: {:?}",
+            updated.len(),
+            updated
+          );
+        }
+      }
+      Err(e) => {
+        log::error!("Failed to update profiles to latest installed versions: {e}");
+      }
+    }
+  }
+
+  /// Check if a specific profile has an available update
+  fn check_profile_update(
+    &self,
+    profile: &BrowserProfile,
+    available_versions: &[BrowserVersionInfo],
+  ) -> Result<Option<UpdateNotification>, Box<dyn std::error::Error + Send + Sync>> {
+    let current_version = &profile.version;
+
+    let best_update = available_versions
+      .iter()
+      .filter(|v| self.is_version_newer(&v.version, current_version))
+      .max_by(|a, b| self.compare_versions(&a.version, &b.version));
+
+    if let Some(update_version) = best_update {
+      let notification = UpdateNotification {
+        id: format!(
+          "{}_{}_to_{}",
+          profile.browser, current_version, update_version.version
+        ),
+        browser: profile.browser.clone(),
+        current_version: current_version.clone(),
+        new_version: update_version.version.clone(),
+        affected_profiles: vec![profile.name.clone()],
+        timestamp: std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .unwrap()
+          .as_secs(),
+      };
+      Ok(Some(notification))
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// Group update notifications by browser and version
+  pub fn group_update_notifications(
+    &self,
+    notifications: Vec<UpdateNotification>,
+  ) -> Vec<UpdateNotification> {
+    let mut grouped: HashMap<String, UpdateNotification> = HashMap::new();
+
+    for notification in notifications {
+      let key = format!("{}_{}", notification.browser, notification.new_version);
+
+      if let Some(existing) = grouped.get_mut(&key) {
+        // Merge affected profiles
+        existing
+          .affected_profiles
+          .extend(notification.affected_profiles);
+        existing.affected_profiles.sort();
+        existing.affected_profiles.dedup();
+      } else {
+        grouped.insert(key, notification);
+      }
+    }
+
+    let mut result: Vec<UpdateNotification> = grouped.into_values().collect();
+
+    result.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
+
+    result
+  }
+
+  /// Automatically update all affected profile versions after browser download
+  pub async fn auto_update_profile_versions(
+    &self,
+    app_handle: &tauri::AppHandle,
+    browser: &str,
+    new_version: &str,
+  ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles: {e}"))?;
+
+    let mut updated_profiles = Vec::new();
+
+    // Find all profiles for this browser that should be updated
+    for profile in profiles {
+      if profile.browser == browser {
+        if profile.is_cross_os() {
+          continue;
+        }
+
+        // Check if profile is currently running
+        if profile.process_id.is_some() {
+          // Store as pending update so it gets applied when browser closes
+          log::info!(
+            "Profile {} is running, storing pending update {} -> {}",
+            profile.name,
+            profile.version,
+            new_version
+          );
+          let mut state = self.load_auto_update_state().unwrap_or_default();
+          let notification = UpdateNotification {
+            id: format!("{}_{}_to_{}", browser, profile.version, new_version),
+            browser: browser.to_string(),
+            current_version: profile.version.clone(),
+            new_version: new_version.to_string(),
+            affected_profiles: vec![profile.name.clone()],
+            timestamp: std::time::SystemTime::now()
+              .duration_since(std::time::UNIX_EPOCH)
+              .unwrap_or_default()
+              .as_secs(),
+          };
+          // Add if not already pending
+          if !state
+            .pending_updates
+            .iter()
+            .any(|u| u.id == notification.id)
+          {
+            state.pending_updates.push(notification);
+            let _ = self.save_auto_update_state(&state);
+          }
+          continue;
+        }
+
+        // Check if this is an update (newer version)
+        if self.is_version_newer(new_version, &profile.version) {
+          // Update the profile version
+          match self.profile_manager.update_profile_version(
+            app_handle,
+            &profile.id.to_string(),
+            new_version,
+          ) {
+            Ok(_) => {
+              updated_profiles.push(profile.name);
+            }
+            Err(e) => {
+              log::error!("Failed to update profile {}: {}", profile.name, e);
+            }
+          }
+        }
+      }
+    }
+
+    Ok(updated_profiles)
+  }
+
+  /// Complete browser update process with auto-update of profile versions
+  pub async fn complete_browser_update_with_auto_update(
+    &self,
+    app_handle: &tauri::AppHandle,
+    browser: &str,
+    new_version: &str,
+  ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Auto-update profile versions first
+    let updated_profiles = self
+      .auto_update_profile_versions(app_handle, browser, new_version)
+      .await?;
+
+    // Remove browser from disabled list and clean up auto-update tracking
+    let mut state = self.load_auto_update_state()?;
+    state.disabled_browsers.remove(browser);
+    let download_key = format!("{browser}-{new_version}");
+    state.auto_update_downloads.remove(&download_key);
+    self.save_auto_update_state(&state)?;
+
+    Ok(updated_profiles)
+  }
+
+  /// Dismiss update notification
+  pub fn dismiss_update_notification(
+    &self,
+    notification_id: &str,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut state = self.load_auto_update_state()?;
+    state.pending_updates.retain(|n| n.id != notification_id);
+    self.save_auto_update_state(&state)?;
+    Ok(())
+  }
+
+  fn is_version_newer(&self, version1: &str, version2: &str) -> bool {
+    crate::api_client::is_version_newer(version1, version2)
+  }
+
+  fn compare_versions(&self, version1: &str, version2: &str) -> std::cmp::Ordering {
+    crate::api_client::compare_versions(version1, version2)
+  }
+
+  fn get_auto_update_state_file(&self) -> PathBuf {
+    self
+      .settings_manager
+      .get_settings_dir()
+      .join("auto_update_state.json")
+  }
+
+  pub fn load_auto_update_state(
+    &self,
+  ) -> Result<AutoUpdateState, Box<dyn std::error::Error + Send + Sync>> {
+    let state_file = self.get_auto_update_state_file();
+
+    if !state_file.exists() {
+      return Ok(AutoUpdateState::default());
+    }
+
+    let content = fs::read_to_string(state_file)?;
+    let state: AutoUpdateState = serde_json::from_str(&content)?;
+    Ok(state)
+  }
+
+  pub fn save_auto_update_state(
+    &self,
+    state: &AutoUpdateState,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let settings_dir = self.settings_manager.get_settings_dir();
+    std::fs::create_dir_all(&settings_dir)?;
+
+    let state_file = self.get_auto_update_state_file();
+    let json = serde_json::to_string_pretty(state)?;
+    fs::write(state_file, json)?;
+
+    Ok(())
+  }
+
+  /// Get pending update versions for a specific browser
+  /// Returns a set of (browser, version) pairs that have pending updates
+  pub fn get_pending_update_versions(
+    &self,
+  ) -> Result<std::collections::HashSet<(String, String)>, Box<dyn std::error::Error + Send + Sync>>
+  {
+    let state = self.load_auto_update_state()?;
+    let mut pending_versions = std::collections::HashSet::new();
+
+    for update in &state.pending_updates {
+      pending_versions.insert((update.browser.clone(), update.new_version.clone()));
+    }
+
+    Ok(pending_versions)
+  }
+
+  /// Get pending update for a specific browser version if it exists
+  pub fn get_pending_update(
+    &self,
+    browser: &str,
+    current_version: &str,
+  ) -> Result<Option<UpdateNotification>, Box<dyn std::error::Error + Send + Sync>> {
+    let state = self.load_auto_update_state()?;
+
+    for update in &state.pending_updates {
+      if update.browser == browser && update.current_version == current_version {
+        return Ok(Some(update.clone()));
+      }
+    }
+
+    Ok(None)
+  }
+
+  /// Get the latest installed version for a browser from the downloaded browsers registry
+  pub fn get_latest_installed_version(&self, browser: &str) -> Option<String> {
+    let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+    let versions = registry.get_downloaded_versions(browser);
+    versions
+      .into_iter()
+      .filter(|v| registry.is_browser_downloaded(browser, v))
+      .max_by(|a, b| self.compare_versions(a, b))
+  }
+
+  /// Update a single profile to the latest installed version for its browser.
+  /// Used when a browser closes to ensure it's on the latest version.
+  pub fn update_profile_to_latest_installed(
+    &self,
+    app_handle: &tauri::AppHandle,
+    profile: &crate::profile::BrowserProfile,
+  ) -> Option<crate::profile::BrowserProfile> {
+    let latest = self.get_latest_installed_version(&profile.browser)?;
+
+    if !self.is_version_newer(&latest, &profile.version) {
+      return None;
+    }
+
+    match self
+      .profile_manager
+      .update_profile_version(app_handle, &profile.id.to_string(), &latest)
+    {
+      Ok(updated) => {
+        log::info!(
+          "Updated profile {} from {} {} to latest installed version {}",
+          profile.name,
+          profile.browser,
+          profile.version,
+          latest
+        );
+        Some(updated)
+      }
+      Err(e) => {
+        log::error!(
+          "Failed to update profile {} to latest installed version: {e}",
+          profile.name
+        );
+        None
+      }
+    }
+  }
+
+  /// Update all non-running profiles to the latest installed version for each browser.
+  /// Handles the case where a newer version was downloaded but profiles weren't updated.
+  pub fn update_profiles_to_latest_installed(
+    &self,
+    app_handle: &tauri::AppHandle,
+  ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+    let profiles = self
+      .profile_manager
+      .list_profiles()
+      .map_err(|e| format!("Failed to list profiles: {e}"))?;
+
+    let mut all_updated = Vec::new();
+
+    // Group profiles by browser
+    let mut browser_profiles: HashMap<String, Vec<BrowserProfile>> = HashMap::new();
+    for profile in profiles {
+      if profile.is_cross_os() {
+        continue;
+      }
+      browser_profiles
+        .entry(profile.browser.clone())
+        .or_default()
+        .push(profile);
+    }
+
+    for (browser, profiles) in browser_profiles {
+      let installed_versions = registry.get_downloaded_versions(&browser);
+      if installed_versions.is_empty() {
+        continue;
+      }
+
+      // Find the latest installed version that actually exists on disk
+      let latest_installed = installed_versions
+        .iter()
+        .filter(|v| registry.is_browser_downloaded(&browser, v))
+        .max_by(|a, b| self.compare_versions(a, b));
+
+      let latest_version = match latest_installed {
+        Some(v) => v.clone(),
+        None => continue,
+      };
+
+      for profile in profiles {
+        if profile.process_id.is_some() {
+          continue;
+        }
+
+        if !self.is_version_newer(&latest_version, &profile.version) {
+          continue;
+        }
+
+        match self.profile_manager.update_profile_version(
+          app_handle,
+          &profile.id.to_string(),
+          &latest_version,
+        ) {
+          Ok(_) => {
+            log::info!(
+              "Updated profile {} from {} {} to latest installed version {}",
+              profile.name,
+              browser,
+              profile.version,
+              latest_version
+            );
+            all_updated.push(profile.name);
+          }
+          Err(e) => {
+            log::error!("Failed to update profile {}: {e}", profile.name);
+          }
+        }
+      }
+    }
+
+    Ok(all_updated)
+  }
+}
+
+// Tauri commands
+
+#[tauri::command]
+pub async fn check_for_browser_updates() -> Result<Vec<UpdateNotification>, String> {
+  let updater = AutoUpdater::instance();
+  let notifications = updater
+    .check_for_updates()
+    .await
+    .map_err(|e| format!("Failed to check for updates: {e}"))?;
+  let grouped = updater.group_update_notifications(notifications);
+  Ok(grouped)
+}
+
+#[tauri::command]
+pub async fn dismiss_update_notification(notification_id: String) -> Result<(), String> {
+  let updater = AutoUpdater::instance();
+  updater
+    .dismiss_update_notification(&notification_id)
+    .map_err(|e| format!("Failed to dismiss notification: {e}"))
+}
+
+#[tauri::command]
+pub async fn complete_browser_update_with_auto_update(
+  app_handle: tauri::AppHandle,
+  browser: String,
+  new_version: String,
+) -> Result<Vec<String>, String> {
+  let updater = AutoUpdater::instance();
+  updater
+    .complete_browser_update_with_auto_update(&app_handle, &browser, &new_version)
+    .await
+    .map_err(|e| format!("Failed to complete browser update: {e}"))
+}
+
+#[tauri::command]
+pub async fn check_for_updates_with_progress(app_handle: tauri::AppHandle) {
+  let updater = AutoUpdater::instance();
+  updater.check_for_updates_with_progress(&app_handle).await;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn create_test_profile(name: &str, browser: &str, version: &str) -> BrowserProfile {
+    BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      name: name.to_string(),
+      browser: browser.to_string(),
+      version: version.to_string(),
+      process_id: None,
+      proxy_id: None,
+      vpn_id: None,
+      launch_hook: None,
+      last_launch: None,
+      release_type: "stable".to_string(),
+      wayfern_config: None,
+      group_id: None,
+      tags: Vec::new(),
+      note: None,
+      window_color: None,
+      sync_mode: crate::profile::types::SyncMode::Disabled,
+      encryption_salt: None,
+      last_sync: None,
+      host_os: None,
+      ephemeral: false,
+      extension_group_id: None,
+      proxy_bypass_rules: Vec::new(),
+      created_by_id: None,
+      created_by_email: None,
+      dns_blocklist: None,
+      password_protected: false,
+      clear_on_close: false,
+      created_at: None,
+      updated_at: None,
+    }
+  }
+
+  fn create_test_version_info(version: &str) -> BrowserVersionInfo {
+    BrowserVersionInfo {
+      version: version.to_string(),
+      date: "2024-01-01".to_string(),
+    }
+  }
+
+  #[test]
+  fn test_compare_versions() {
+    let updater = AutoUpdater::instance();
+
+    assert_eq!(
+      updater.compare_versions("1.0.0", "1.0.0"),
+      std::cmp::Ordering::Equal
+    );
+    assert_eq!(
+      updater.compare_versions("1.0.1", "1.0.0"),
+      std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+      updater.compare_versions("1.0.0", "1.0.1"),
+      std::cmp::Ordering::Less
+    );
+    assert_eq!(
+      updater.compare_versions("2.0.0", "1.9.9"),
+      std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+      updater.compare_versions("1.10.0", "1.9.0"),
+      std::cmp::Ordering::Greater
+    );
+  }
+
+  #[test]
+  fn test_is_version_newer() {
+    let updater = AutoUpdater::instance();
+
+    assert!(updater.is_version_newer("1.0.1", "1.0.0"));
+    assert!(updater.is_version_newer("2.0.0", "1.9.9"));
+    assert!(!updater.is_version_newer("1.0.0", "1.0.1"));
+    assert!(!updater.is_version_newer("1.0.0", "1.0.0"));
+  }
+
+  #[test]
+  fn test_check_profile_update_picks_newer_wayfern_version() {
+    let updater = AutoUpdater::instance();
+    let profile = create_test_profile("test", "wayfern", "138.0.7204.49");
+    let versions = vec![
+      create_test_version_info("138.0.7204.50"),
+      create_test_version_info("138.0.7204.48"),
+    ];
+
+    let result = updater.check_profile_update(&profile, &versions).unwrap();
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().new_version, "138.0.7204.50");
+  }
+
+  #[test]
+  fn test_check_profile_update_no_update_available() {
+    let updater = AutoUpdater::instance();
+    let profile = create_test_profile("test", "wayfern", "138.0.7204.50");
+    let versions = vec![
+      create_test_version_info("138.0.7204.49"),
+      create_test_version_info("138.0.7204.50"),
+    ];
+
+    let result = updater.check_profile_update(&profile, &versions).unwrap();
+    assert!(result.is_none());
+  }
+
+  #[test]
+  fn test_group_update_notifications() {
+    let updater = AutoUpdater::instance();
+    let notifications = vec![
+      UpdateNotification {
+        id: "wayfern_138.0.7204.49_to_138.0.7204.50_profile1".to_string(),
+        browser: "wayfern".to_string(),
+        current_version: "138.0.7204.49".to_string(),
+        new_version: "138.0.7204.50".to_string(),
+        affected_profiles: vec!["profile1".to_string()],
+        timestamp: 1000,
+      },
+      UpdateNotification {
+        id: "wayfern_138.0.7204.49_to_138.0.7204.50_profile2".to_string(),
+        browser: "wayfern".to_string(),
+        current_version: "138.0.7204.49".to_string(),
+        new_version: "138.0.7204.50".to_string(),
+        affected_profiles: vec!["profile2".to_string()],
+        timestamp: 1001,
+      },
+    ];
+
+    let grouped = updater.group_update_notifications(notifications);
+
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0].affected_profiles.len(), 2);
+  }
+
+  #[test]
+  fn test_auto_update_state_persistence() {
+    use std::sync::Once;
+    use tempfile::TempDir;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      // Initialize any required static data
+    });
+
+    // Create a temporary directory for testing
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a mock settings manager that uses the temp directory
+    struct TestSettingsManager {
+      settings_dir: std::path::PathBuf,
+    }
+
+    impl TestSettingsManager {
+      fn new(settings_dir: std::path::PathBuf) -> Self {
+        Self { settings_dir }
+      }
+
+      fn get_settings_dir(&self) -> std::path::PathBuf {
+        self.settings_dir.clone()
+      }
+    }
+
+    let test_settings_manager = TestSettingsManager::new(temp_dir.path().to_path_buf());
+
+    let mut state = AutoUpdateState::default();
+    state.disabled_browsers.insert("testbrowser".to_string());
+    state
+      .auto_update_downloads
+      .insert("testbrowser-1.1.0".to_string());
+    state.pending_updates.push(UpdateNotification {
+      id: "test".to_string(),
+      browser: "testbrowser".to_string(),
+      current_version: "1.0.0".to_string(),
+      new_version: "1.1.0".to_string(),
+      affected_profiles: vec!["profile1".to_string()],
+      timestamp: 1000,
+    });
+
+    // Test save and load
+    let state_file = test_settings_manager
+      .get_settings_dir()
+      .join("auto_update_state.json");
+    std::fs::create_dir_all(test_settings_manager.get_settings_dir())
+      .expect("Failed to create settings directory");
+    let json = serde_json::to_string_pretty(&state).expect("Failed to serialize state");
+    std::fs::write(&state_file, json).expect("Failed to write state file");
+
+    // Load state
+    let content = std::fs::read_to_string(&state_file).expect("Failed to read state file");
+    let loaded_state: AutoUpdateState =
+      serde_json::from_str(&content).expect("Failed to deserialize state");
+
+    assert_eq!(loaded_state.disabled_browsers.len(), 1);
+    assert!(loaded_state.disabled_browsers.contains("testbrowser"));
+    assert_eq!(loaded_state.auto_update_downloads.len(), 1);
+    assert!(loaded_state
+      .auto_update_downloads
+      .contains("testbrowser-1.1.0"));
+    assert_eq!(loaded_state.pending_updates.len(), 1);
+    assert_eq!(loaded_state.pending_updates[0].id, "test");
+  }
+
+  #[tokio::test]
+  async fn test_browser_disable_enable_cycle() {
+    use tempfile::TempDir;
+
+    // Create a temporary directory for testing
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a mock settings manager that uses the temp directory
+    struct TestSettingsManager {
+      settings_dir: std::path::PathBuf,
+    }
+
+    impl TestSettingsManager {
+      fn new(settings_dir: std::path::PathBuf) -> Self {
+        Self { settings_dir }
+      }
+
+      fn get_settings_dir(&self) -> std::path::PathBuf {
+        self.settings_dir.clone()
+      }
+    }
+
+    let test_settings_manager = TestSettingsManager::new(temp_dir.path().to_path_buf());
+
+    // Test browser disable/enable cycle with manual state management
+    let state_file = test_settings_manager
+      .get_settings_dir()
+      .join("auto_update_state.json");
+    std::fs::create_dir_all(test_settings_manager.get_settings_dir())
+      .expect("Failed to create settings directory");
+
+    // Initially not disabled (empty state file means default state)
+    let state = AutoUpdateState::default();
+    assert!(
+      !state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should not be disabled initially"
+    );
+
+    // Start update (should disable)
+    let mut state = AutoUpdateState::default();
+    state.disabled_browsers.insert("testbrowser".to_string());
+    state
+      .auto_update_downloads
+      .insert("testbrowser-1.1.0".to_string());
+    let json = serde_json::to_string_pretty(&state).expect("Failed to serialize state");
+    std::fs::write(&state_file, json).expect("Failed to write state file");
+
+    // Check that it's disabled
+    let content = std::fs::read_to_string(&state_file).expect("Failed to read state file");
+    let loaded_state: AutoUpdateState =
+      serde_json::from_str(&content).expect("Failed to deserialize state");
+    assert!(
+      loaded_state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should be disabled"
+    );
+    assert!(
+      loaded_state
+        .auto_update_downloads
+        .contains("testbrowser-1.1.0"),
+      "testbrowser download should be tracked"
+    );
+
+    // Complete update (should enable)
+    let mut state = loaded_state;
+    state.disabled_browsers.remove("testbrowser");
+    state.auto_update_downloads.remove("testbrowser-1.1.0");
+    let json = serde_json::to_string_pretty(&state).expect("Failed to serialize final state");
+    std::fs::write(&state_file, json).expect("Failed to write final state file");
+
+    // Check that it's enabled again
+    let content = std::fs::read_to_string(&state_file).expect("Failed to read final state file");
+    let final_state: AutoUpdateState =
+      serde_json::from_str(&content).expect("Failed to deserialize final state");
+    assert!(
+      !final_state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should be enabled again"
+    );
+    assert!(
+      !final_state
+        .auto_update_downloads
+        .contains("testbrowser-1.1.0"),
+      "testbrowser download should not be tracked anymore"
+    );
+  }
+
+  #[test]
+  fn test_dismiss_update_notification() {
+    use tempfile::TempDir;
+
+    // Create a temporary directory for testing
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a mock settings manager that uses the temp directory
+    struct TestSettingsManager {
+      settings_dir: std::path::PathBuf,
+    }
+
+    impl TestSettingsManager {
+      fn new(settings_dir: std::path::PathBuf) -> Self {
+        Self { settings_dir }
+      }
+
+      fn get_settings_dir(&self) -> std::path::PathBuf {
+        self.settings_dir.clone()
+      }
+    }
+
+    let test_settings_manager = TestSettingsManager::new(temp_dir.path().to_path_buf());
+
+    let mut state = AutoUpdateState::default();
+    state.pending_updates.push(UpdateNotification {
+      id: "test_notification".to_string(),
+      browser: "testbrowser".to_string(),
+      current_version: "1.0.0".to_string(),
+      new_version: "1.1.0".to_string(),
+      affected_profiles: vec!["profile1".to_string()],
+      timestamp: 1000,
+    });
+
+    // Save initial state
+    let state_file = test_settings_manager
+      .get_settings_dir()
+      .join("auto_update_state.json");
+    std::fs::create_dir_all(test_settings_manager.get_settings_dir())
+      .expect("Failed to create settings directory");
+    let json = serde_json::to_string_pretty(&state).expect("Failed to serialize initial state");
+    std::fs::write(&state_file, json).expect("Failed to write initial state file");
+
+    // Dismiss notification (remove from pending updates)
+    state
+      .pending_updates
+      .retain(|n| n.id != "test_notification");
+    let json = serde_json::to_string_pretty(&state).expect("Failed to serialize updated state");
+    std::fs::write(&state_file, json).expect("Failed to write updated state file");
+
+    // Check that it's removed
+    let content = std::fs::read_to_string(&state_file).expect("Failed to read updated state file");
+    let loaded_state: AutoUpdateState =
+      serde_json::from_str(&content).expect("Failed to deserialize updated state");
+    assert_eq!(
+      loaded_state.pending_updates.len(),
+      0,
+      "Pending updates should be empty after dismissal"
+    );
+  }
+}
+
+// Global singleton instance
+lazy_static::lazy_static! {
+  static ref AUTO_UPDATER: AutoUpdater = AutoUpdater::new();
+}

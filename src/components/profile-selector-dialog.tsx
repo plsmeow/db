@@ -1,0 +1,322 @@
+"use client";
+
+import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { LoadingButton } from "@/components/loading-button";
+import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useBrowserState } from "@/hooks/use-browser-state";
+import { useProfileEvents } from "@/hooks/use-profile-events";
+import { useProxyEvents } from "@/hooks/use-proxy-events";
+import { translateBackendError } from "@/lib/backend-errors";
+import { getBrowserDisplayName, getBrowserIcon } from "@/lib/browser-utils";
+import { showErrorToast } from "@/lib/toast-utils";
+import type { BrowserProfile } from "@/types";
+import { CopyToClipboard } from "./ui/copy-to-clipboard";
+import { RippleButton } from "./ui/ripple";
+
+interface ProfileSelectorDialogProps {
+  isOpen: boolean;
+  onClose: () => void;
+  isUpdating: (browser: string) => boolean;
+  url?: string;
+  runningProfiles?: Set<string>;
+}
+
+export function ProfileSelectorDialog({
+  isOpen,
+  onClose,
+  url,
+  runningProfiles: externalRunningProfiles,
+  isUpdating,
+}: ProfileSelectorDialogProps) {
+  const { t } = useTranslation();
+  // Use the centralized profile events hook
+  const { profiles: rawProfiles, runningProfiles: hookRunningProfiles } =
+    useProfileEvents();
+  const profiles = useMemo(
+    () =>
+      [...rawProfiles].sort((a, b) =>
+        a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+      ),
+    [rawProfiles],
+  );
+
+  // Use external runningProfiles if provided, otherwise use hook's runningProfiles
+  const runningProfiles = externalRunningProfiles ?? hookRunningProfiles;
+
+  const { storedProxies } = useProxyEvents();
+
+  const [selectedProfile, setSelectedProfile] = useState<string | null>(null);
+  const [isLaunching, setIsLaunching] = useState(false);
+  const [launchingProfiles, setLaunchingProfiles] = useState<Set<string>>(
+    new Set(),
+  );
+  const [stoppingProfiles] = useState<Set<string>>(new Set());
+
+  // Use shared browser state hook
+  const browserState = useBrowserState(
+    profiles,
+    runningProfiles,
+    isUpdating,
+    launchingProfiles,
+    stoppingProfiles,
+  );
+
+  // Helper function to check if a profile has a proxy
+  const hasProxy = useCallback(
+    (profile: BrowserProfile): boolean => {
+      if (!profile.proxy_id) return false;
+      const proxy = storedProxies.find((p) => p.id === profile.proxy_id);
+      return proxy !== undefined;
+    },
+    [storedProxies],
+  );
+
+  // Helper function to get tooltip content for profiles - now uses shared hook
+  const getProfileTooltipContent = (profile: BrowserProfile): string | null => {
+    return browserState.getProfileTooltipContent(profile);
+  };
+
+  const handleOpenUrl = useCallback(async () => {
+    if (!selectedProfile || !url) return;
+
+    setIsLaunching(true);
+    const selected = profiles.find((p) => p.name === selectedProfile);
+    if (!selected) return;
+
+    setLaunchingProfiles((prev) => new Set(prev).add(selected.id));
+    try {
+      await invoke("open_url_with_profile", {
+        profileId: selected.id,
+        url,
+        consentToken: null,
+      });
+      onClose();
+    } catch (error) {
+      console.error("Failed to open URL with profile:", error);
+      // This path reaches the browser without going through page.tsx's gate,
+      // so a launch the gate blocks surfaces here. Without a toast the deep
+      // link would simply appear to do nothing.
+      showErrorToast(translateBackendError(t, error));
+    } finally {
+      setIsLaunching(false);
+      if (selected) {
+        setLaunchingProfiles((prev) => {
+          const next = new Set(prev);
+          next.delete(selected.id);
+          return next;
+        });
+      }
+    }
+  }, [selectedProfile, url, onClose, profiles, t]);
+
+  const handleCancel = useCallback(() => {
+    setSelectedProfile(null);
+    onClose();
+  }, [onClose]);
+
+  const selectedProfileData = profiles.find((p) => p.name === selectedProfile);
+
+  // Check if the selected profile can be used for opening links
+  const canOpenWithSelectedProfile = () => {
+    if (!selectedProfileData) return false;
+    return browserState.canUseProfileForLinks(selectedProfileData);
+  };
+
+  // Get tooltip content for disabled profiles
+  const getTooltipContent = () => {
+    if (!selectedProfileData) return null;
+    return getProfileTooltipContent(selectedProfileData);
+  };
+
+  // Auto-select first available profile when dialog opens and profiles are loaded
+  useEffect(() => {
+    if (isOpen && profiles.length > 0 && !selectedProfile) {
+      // First, try to find a running profile that can be used for opening links
+      const runningAvailableProfile = profiles.find((profile) => {
+        const isRunning = runningProfiles.has(profile.id);
+        // Simple check without browserState dependency
+        return isRunning;
+      });
+
+      if (runningAvailableProfile) {
+        setSelectedProfile(runningAvailableProfile.name);
+      } else {
+        setSelectedProfile(profiles[0].name);
+      }
+    }
+  }, [isOpen, profiles, selectedProfile, runningProfiles]);
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t("profileSelector.chooseProfileTitle")}</DialogTitle>
+        </DialogHeader>
+
+        <div className="grid gap-4 py-4">
+          {url && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label className="text-sm font-medium">
+                  {t("profileSelector.openingUrl")}
+                </Label>
+                <CopyToClipboard
+                  text={url}
+                  successMessage={t("profileSelector.urlCopied")}
+                />
+              </div>
+              <div className="max-h-24 overflow-y-auto rounded bg-muted p-2 text-sm break-all">
+                {url}
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <Label htmlFor="profile-select">
+              {t("profileSelector.selectProfileLabel")}
+            </Label>
+            {profiles.length === 0 ? (
+              <div className="space-y-2">
+                <div className="text-sm text-muted-foreground">
+                  {t("profileSelector.noneAvailableShort")}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {t("profileSelector.noneAvailableLong")}
+                </div>
+              </div>
+            ) : (
+              <Select
+                value={selectedProfile ?? undefined}
+                onValueChange={setSelectedProfile}
+              >
+                <SelectTrigger>
+                  <SelectValue
+                    placeholder={t("profileSelector.chooseAProfile")}
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {profiles.map((profile) => {
+                    const isRunning = runningProfiles.has(profile.id);
+                    const canUseForLinks =
+                      browserState.canUseProfileForLinks(profile);
+                    const tooltipContent = getProfileTooltipContent(profile);
+
+                    return (
+                      <Tooltip key={profile.name}>
+                        <TooltipTrigger asChild>
+                          <div>
+                            <SelectItem
+                              value={profile.name}
+                              disabled={!canUseForLinks}
+                              className="cursor-pointer"
+                            >
+                              <div
+                                className={`flex items-center gap-2 ${
+                                  !canUseForLinks ? "opacity-50" : ""
+                                }`}
+                              >
+                                <div className="flex items-center gap-3 rounded-lg px-2 py-1">
+                                  <div className="flex items-center gap-2">
+                                    {(() => {
+                                      const IconComponent = getBrowserIcon(
+                                        profile.browser,
+                                      );
+                                      return IconComponent ? (
+                                        <IconComponent className="size-4" />
+                                      ) : null;
+                                    })()}
+                                  </div>
+                                  <div className="flex-1 text-right">
+                                    <div className="font-medium">
+                                      {profile.name}
+                                    </div>
+                                  </div>
+                                </div>
+                                <Badge variant="secondary" className="text-xs">
+                                  {getBrowserDisplayName(profile.browser)}
+                                </Badge>
+                                {hasProxy(profile) && (
+                                  <Badge variant="outline" className="text-xs">
+                                    {t("profileSelector.badgeProxy")}
+                                  </Badge>
+                                )}
+                                {isRunning && (
+                                  <Badge variant="default" className="text-xs">
+                                    {t("profileSelector.badgeRunning")}
+                                  </Badge>
+                                )}
+                                {!canUseForLinks && (
+                                  <Badge
+                                    variant="destructive"
+                                    className="text-xs"
+                                  >
+                                    {t("profileSelector.badgeUnavailable")}
+                                  </Badge>
+                                )}
+                              </div>
+                            </SelectItem>
+                          </div>
+                        </TooltipTrigger>
+                        {tooltipContent && (
+                          <TooltipContent>{tooltipContent}</TooltipContent>
+                        )}
+                      </Tooltip>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter>
+          <RippleButton variant="outline" onClick={handleCancel}>
+            {t("common.buttons.cancel")}
+          </RippleButton>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <LoadingButton
+                  isLoading={isLaunching}
+                  onClick={() => void handleOpenUrl()}
+                  disabled={
+                    !selectedProfile ||
+                    profiles.length === 0 ||
+                    !canOpenWithSelectedProfile()
+                  }
+                >
+                  {t("profileSelector.openButton")}
+                </LoadingButton>
+              </span>
+            </TooltipTrigger>
+            {getTooltipContent() && (
+              <TooltipContent>{getTooltipContent()}</TooltipContent>
+            )}
+          </Tooltip>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

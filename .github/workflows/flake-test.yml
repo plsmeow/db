@@ -1,0 +1,57 @@
+name: Flake Test
+
+on:
+  pull_request:
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/flake-test.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/flake-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flake:
+    name: validate-flake
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a6f7623b2e2401f485f1eead77ced45bd99b09b0 #v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Evaluate flake outputs
+        run: nix flake show --all-systems
+
+      - name: Check setup app is exposed
+        run: nix eval .#apps.x86_64-linux.setup.program --raw
+
+      - name: Run flake setup app
+        env:
+          CI: "true"
+        run: nix run .#setup
+
+      - name: Run flake info app
+        run: nix run .#info
+
+      # `nix flake show` above only evaluates the flake. This step actually
+      # compiles the app inside the Nix environment, which is what catches a
+      # missing build-time dependency — in particular libayatana-appindicator
+      # (required by libappindicator-sys for the Linux system tray). The build
+      # fails here if that dependency is dropped from the flake.
+      - name: Build the app via the flake
+        run: nix run .#build

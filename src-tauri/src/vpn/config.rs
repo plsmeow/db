@@ -1,0 +1,344 @@
+//! VPN configuration types and parsing.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use thiserror::Error;
+
+/// VPN-related errors
+#[derive(Error, Debug)]
+pub enum VpnError {
+  #[error("Unknown VPN config format")]
+  UnknownFormat,
+  #[error("Invalid WireGuard config: {0}")]
+  InvalidWireGuard(String),
+  #[error("Storage error: {0}")]
+  Storage(String),
+  #[error("Connection error: {0}")]
+  Connection(String),
+  #[error("Encryption error: {0}")]
+  Encryption(String),
+  #[error("IO error: {0}")]
+  Io(#[from] std::io::Error),
+  #[error("VPN not found: {0}")]
+  NotFound(String),
+  #[error("Tunnel error: {0}")]
+  Tunnel(String),
+}
+
+/// The type of VPN configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VpnType {
+  WireGuard,
+}
+
+impl std::fmt::Display for VpnType {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      VpnType::WireGuard => write!(f, "WireGuard"),
+    }
+  }
+}
+
+/// A stored VPN configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnConfig {
+  pub id: String,
+  pub name: String,
+  pub vpn_type: VpnType,
+  pub config_data: String, // Raw config content (encrypted at rest)
+  pub created_at: i64,
+  pub last_used: Option<i64>,
+  #[serde(default)]
+  pub sync_enabled: bool,
+  #[serde(default)]
+  pub last_sync: Option<u64>,
+  /// Unix seconds of the last meaningful user edit. Source of truth for sync
+  /// conflict resolution (last-write-wins); bumped on config edits only.
+  #[serde(default)]
+  pub updated_at: Option<u64>,
+}
+
+/// Parsed WireGuard configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireGuardConfig {
+  pub private_key: String,
+  pub address: String,
+  pub dns: Option<String>,
+  pub mtu: Option<u16>,
+  pub peer_public_key: String,
+  pub peer_endpoint: String,
+  pub allowed_ips: Vec<String>,
+  pub persistent_keepalive: Option<u16>,
+  pub preshared_key: Option<String>,
+}
+
+/// Result of importing a VPN configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnImportResult {
+  pub success: bool,
+  pub vpn_id: Option<String>,
+  pub vpn_type: Option<VpnType>,
+  pub name: String,
+  pub error: Option<String>,
+}
+
+/// VPN connection status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnStatus {
+  pub connected: bool,
+  pub vpn_id: String,
+  pub connected_at: Option<i64>,
+  pub bytes_sent: Option<u64>,
+  pub bytes_received: Option<u64>,
+  pub last_handshake: Option<i64>,
+}
+
+/// Detect the VPN type from file content and filename
+pub fn detect_vpn_type(content: &str, filename: &str) -> Result<VpnType, VpnError> {
+  let filename_lower = filename.to_lowercase();
+
+  if filename_lower.ends_with(".conf")
+    && content.contains("[Interface]")
+    && content.contains("[Peer]")
+  {
+    return Ok(VpnType::WireGuard);
+  }
+
+  if content.contains("[Interface]") && content.contains("PrivateKey") && content.contains("[Peer]")
+  {
+    return Ok(VpnType::WireGuard);
+  }
+
+  Err(VpnError::UnknownFormat)
+}
+
+/// Parse a WireGuard configuration file
+pub fn parse_wireguard_config(content: &str) -> Result<WireGuardConfig, VpnError> {
+  let mut interface: HashMap<String, String> = HashMap::new();
+  let mut peer: HashMap<String, String> = HashMap::new();
+  let mut current_section: Option<&str> = None;
+
+  // Strip a UTF-8 BOM if present — some editors/tools emit one and it would
+  // otherwise prepend invisible bytes to the first section header
+  let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
+  for line in content.lines() {
+    let line = line.trim();
+
+    // Skip empty lines and comments
+    if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+      continue;
+    }
+
+    // Check for section headers
+    if line == "[Interface]" {
+      current_section = Some("interface");
+      continue;
+    }
+    if line == "[Peer]" {
+      current_section = Some("peer");
+      continue;
+    }
+
+    // Parse key-value pairs (split on the first `=` so base64 padding is preserved)
+    if let Some((key, value)) = line.split_once('=') {
+      let key = key.trim().to_string();
+      let value = value.trim().to_string();
+
+      match current_section {
+        Some("interface") => {
+          interface.insert(key, value);
+        }
+        Some("peer") => {
+          peer.insert(key, value);
+        }
+        _ => {}
+      }
+    }
+  }
+
+  // Validate required fields
+  let private_key = interface
+    .get("PrivateKey")
+    .ok_or_else(|| VpnError::InvalidWireGuard("Missing PrivateKey in [Interface]".to_string()))?
+    .clone();
+  validate_wireguard_key(&private_key, "PrivateKey")?;
+
+  let address = interface
+    .get("Address")
+    .ok_or_else(|| VpnError::InvalidWireGuard("Missing Address in [Interface]".to_string()))?
+    .clone();
+
+  let peer_public_key = peer
+    .get("PublicKey")
+    .ok_or_else(|| VpnError::InvalidWireGuard("Missing PublicKey in [Peer]".to_string()))?
+    .clone();
+  validate_wireguard_key(&peer_public_key, "PublicKey")?;
+
+  let peer_endpoint = peer
+    .get("Endpoint")
+    .ok_or_else(|| VpnError::InvalidWireGuard("Missing Endpoint in [Peer]".to_string()))?
+    .clone();
+
+  let allowed_ips = peer
+    .get("AllowedIPs")
+    .map(|s| s.split(',').map(|ip| ip.trim().to_string()).collect())
+    .unwrap_or_else(|| vec!["0.0.0.0/0".to_string()]);
+
+  let persistent_keepalive = peer.get("PersistentKeepalive").and_then(|s| s.parse().ok());
+
+  let dns = interface.get("DNS").cloned();
+  let mtu = interface.get("MTU").and_then(|s| s.parse().ok());
+  let preshared_key = peer.get("PresharedKey").cloned();
+  if let Some(ref psk) = preshared_key {
+    validate_wireguard_key(psk, "PresharedKey")?;
+  }
+
+  Ok(WireGuardConfig {
+    private_key,
+    address,
+    dns,
+    mtu,
+    peer_public_key,
+    peer_endpoint,
+    allowed_ips,
+    persistent_keepalive,
+    preshared_key,
+  })
+}
+
+/// Validate that a WireGuard key is a base64-encoded 32-byte value.
+/// Reports the field name and a short preview of the bad value so users can
+/// see exactly what went wrong (e.g. a redacted/masked key).
+fn validate_wireguard_key(key: &str, field: &str) -> Result<(), VpnError> {
+  use base64::Engine;
+
+  let decoded = base64::engine::general_purpose::STANDARD
+    .decode(key)
+    .map_err(|e| {
+      let preview: String = key.chars().take(8).collect();
+      VpnError::InvalidWireGuard(format!(
+        "{field} is not valid base64 (starts with {preview:?}): {e}. \
+         Expected a 32-byte base64-encoded key (44 chars ending with '=')."
+      ))
+    })?;
+  if decoded.len() != 32 {
+    return Err(VpnError::InvalidWireGuard(format!(
+      "{field} decoded to {} bytes (expected 32). The config may be truncated or malformed.",
+      decoded.len()
+    )));
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_detect_wireguard_by_extension() {
+    let content = "[Interface]\nPrivateKey = test\n[Peer]\nPublicKey = test";
+    assert_eq!(
+      detect_vpn_type(content, "test.conf").unwrap(),
+      VpnType::WireGuard
+    );
+  }
+
+  #[test]
+  fn test_detect_wireguard_by_content() {
+    let content = "[Interface]\nPrivateKey = testkey123\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = peerkey456\nEndpoint = vpn.example.com:51820";
+    assert_eq!(
+      detect_vpn_type(content, "config").unwrap(),
+      VpnType::WireGuard
+    );
+  }
+
+  #[test]
+  fn test_detect_unknown_format() {
+    let content = "random text that is not a vpn config";
+    assert!(detect_vpn_type(content, "random.txt").is_err());
+  }
+
+  #[test]
+  fn test_reject_openvpn_content() {
+    let content = "client\ndev tun\nproto udp\nremote vpn.example.com 1194";
+    assert!(detect_vpn_type(content, "test.ovpn").is_err());
+    assert!(detect_vpn_type(content, "config").is_err());
+  }
+
+  #[test]
+  fn test_parse_wireguard_config() {
+    let content = r#"
+[Interface]
+PrivateKey = YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=
+Address = 10.0.0.2/24
+DNS = 1.1.1.1
+MTU = 1420
+
+[Peer]
+PublicKey = YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=
+Endpoint = vpn.example.com:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+"#;
+
+    let config = parse_wireguard_config(content).unwrap();
+    assert_eq!(
+      config.private_key,
+      "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+    );
+    assert_eq!(config.address, "10.0.0.2/24");
+    assert_eq!(config.dns, Some("1.1.1.1".to_string()));
+    assert_eq!(config.mtu, Some(1420));
+    assert_eq!(
+      config.peer_public_key,
+      "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI="
+    );
+    assert_eq!(config.peer_endpoint, "vpn.example.com:51820");
+    assert_eq!(config.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
+    assert_eq!(config.persistent_keepalive, Some(25));
+  }
+
+  #[test]
+  fn test_parse_wireguard_config_minimal() {
+    let content = r#"
+[Interface]
+PrivateKey = YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=
+Endpoint = 1.2.3.4:51820
+"#;
+
+    let config = parse_wireguard_config(content).unwrap();
+    assert_eq!(
+      config.private_key,
+      "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+    );
+    assert_eq!(config.address, "10.0.0.2/32");
+    assert!(config.dns.is_none());
+    assert!(config.mtu.is_none());
+    assert_eq!(
+      config.peer_public_key,
+      "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI="
+    );
+    assert_eq!(config.peer_endpoint, "1.2.3.4:51820");
+  }
+
+  #[test]
+  fn test_parse_wireguard_missing_private_key() {
+    let content = r#"
+[Interface]
+Address = 10.0.0.2/24
+
+[Peer]
+PublicKey = key
+Endpoint = 1.2.3.4:51820
+"#;
+
+    let result = parse_wireguard_config(content);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("PrivateKey"));
+  }
+}

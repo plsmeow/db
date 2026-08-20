@@ -1,0 +1,1169 @@
+use super::config::{VpnError, WireGuardConfig};
+use boringtun::noise::{Tunn, TunnResult};
+use boringtun::x25519::{PublicKey, StaticSecret};
+use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::dns;
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
+use smoltcp::socket::udp;
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use std::collections::VecDeque;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+
+const SMOLTCP_TCP_RX_BUF: usize = 65536;
+const SMOLTCP_TCP_TX_BUF: usize = 65536;
+const SMOLTCP_UDP_BUF: usize = 65536;
+
+/// Parse an RFC 1928 §7 UDP request header. Returns the destination endpoint
+/// and the payload offset, or None if malformed, fragmented, or domain-typed.
+/// Only literal IPs are routed through the tunnel: resolving a domain on the
+/// host would leak DNS, and QUIC/WebRTC datagrams always carry literal IPs.
+fn parse_udp_datagram(buf: &[u8]) -> Option<(IpEndpoint, usize)> {
+  if buf.len() < 4 || buf[2] != 0 {
+    // too short, or FRAG != 0 (fragmentation unsupported)
+    return None;
+  }
+  match buf[3] {
+    0x01 => {
+      if buf.len() < 10 {
+        return None;
+      }
+      let ip = Ipv4Address::new(buf[4], buf[5], buf[6], buf[7]);
+      let port = u16::from_be_bytes([buf[8], buf[9]]);
+      Some((IpEndpoint::new(IpAddress::Ipv4(ip), port), 10))
+    }
+    0x04 => {
+      if buf.len() < 22 {
+        return None;
+      }
+      let mut o = [0u8; 16];
+      o.copy_from_slice(&buf[4..20]);
+      let ip = smoltcp::wire::Ipv6Address::from(o);
+      let port = u16::from_be_bytes([buf[20], buf[21]]);
+      Some((IpEndpoint::new(IpAddress::Ipv6(ip), port), 22))
+    }
+    _ => None,
+  }
+}
+
+/// Wrap a tunnel-received datagram in an RFC 1928 §7 UDP reply header naming
+/// `src` as the origin, for delivery back to the browser's relay socket.
+fn build_udp_datagram(src: IpEndpoint, payload: &[u8]) -> Vec<u8> {
+  let mut out = vec![0x00, 0x00, 0x00]; // RSV(2) + FRAG(0)
+  match src.addr {
+    IpAddress::Ipv4(v4) => {
+      out.push(0x01);
+      out.extend_from_slice(&v4.octets());
+    }
+    IpAddress::Ipv6(v6) => {
+      out.push(0x04);
+      out.extend_from_slice(&v6.octets());
+    }
+  }
+  out.extend_from_slice(&src.port.to_be_bytes());
+  out.extend_from_slice(payload);
+  out
+}
+
+struct WgDevice {
+  tunn: Arc<Mutex<Box<Tunn>>>,
+  udp_socket: Arc<UdpSocket>,
+  peer_addr: SocketAddr,
+  rx_queue: VecDeque<Vec<u8>>,
+  tx_queue: VecDeque<Vec<u8>>,
+}
+
+impl WgDevice {
+  fn pump_wg_to_rx(&mut self) {
+    let mut recv_buf = vec![0u8; 2048];
+    loop {
+      match self.udp_socket.recv_from(&mut recv_buf) {
+        Ok((len, _)) => {
+          let mut dst = vec![0u8; 2048];
+          let mut tunn = self.tunn.lock().unwrap();
+          let result = tunn.decapsulate(None, &recv_buf[..len], &mut dst);
+          match result {
+            TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
+              self.rx_queue.push_back(data.to_vec());
+            }
+            TunnResult::WriteToNetwork(response) => {
+              let _ = self.udp_socket.send_to(response, self.peer_addr);
+            }
+            _ => {}
+          }
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+        Err(_) => break,
+      }
+    }
+  }
+
+  fn flush_tx_queue(&mut self) {
+    while let Some(ip_packet) = self.tx_queue.pop_front() {
+      let mut dst = vec![0u8; ip_packet.len() + 256];
+      let mut tunn = self.tunn.lock().unwrap();
+      let result = tunn.encapsulate(&ip_packet, &mut dst);
+      match result {
+        TunnResult::WriteToNetwork(packet) => {
+          if let Err(e) = self.udp_socket.send_to(packet, self.peer_addr) {
+            log::error!("[wg] udp send_to failed: {e}");
+          }
+        }
+        TunnResult::Done => {
+          // boringtun has nothing to send right now (e.g. handshake not yet
+          // complete); silently drop. smoltcp will retransmit.
+        }
+        TunnResult::Err(e) => {
+          log::error!(
+            "[wg] encapsulate error for {}B IP packet: {e:?}",
+            ip_packet.len()
+          );
+        }
+        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+          log::error!("[wg] encapsulate returned unexpected WriteToTunnel — bug?");
+        }
+      }
+    }
+  }
+
+  fn tick_timers(&mut self) {
+    let mut dst = vec![0u8; 2048];
+    let mut tunn = self.tunn.lock().unwrap();
+    let result = tunn.update_timers(&mut dst);
+    if let TunnResult::WriteToNetwork(packet) = result {
+      let _ = self.udp_socket.send_to(packet, self.peer_addr);
+    }
+  }
+}
+
+struct WgRxToken {
+  data: Vec<u8>,
+}
+
+impl RxToken for WgRxToken {
+  fn consume<R, F>(self, f: F) -> R
+  where
+    F: FnOnce(&[u8]) -> R,
+  {
+    f(&self.data)
+  }
+}
+
+struct WgTxToken<'a> {
+  tx_queue: &'a mut VecDeque<Vec<u8>>,
+}
+
+impl<'a> TxToken for WgTxToken<'a> {
+  fn consume<R, F>(self, len: usize, f: F) -> R
+  where
+    F: FnOnce(&mut [u8]) -> R,
+  {
+    let mut buf = vec![0u8; len];
+    let result = f(&mut buf);
+    self.tx_queue.push_back(buf);
+    result
+  }
+}
+
+impl Device for WgDevice {
+  type RxToken<'a> = WgRxToken;
+  type TxToken<'a> = WgTxToken<'a>;
+
+  fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    if let Some(data) = self.rx_queue.pop_front() {
+      Some((
+        WgRxToken { data },
+        WgTxToken {
+          tx_queue: &mut self.tx_queue,
+        },
+      ))
+    } else {
+      None
+    }
+  }
+
+  fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+    Some(WgTxToken {
+      tx_queue: &mut self.tx_queue,
+    })
+  }
+
+  fn capabilities(&self) -> DeviceCapabilities {
+    let mut caps = DeviceCapabilities::default();
+    caps.medium = Medium::Ip;
+    caps.max_transmission_unit = 1420;
+    caps
+  }
+}
+
+fn parse_key(key: &str) -> Result<[u8; 32], VpnError> {
+  let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key)
+    .map_err(|e| VpnError::InvalidWireGuard(format!("Invalid key encoding: {e}")))?;
+  if decoded.len() != 32 {
+    return Err(VpnError::InvalidWireGuard(format!(
+      "Invalid key length: {} (expected 32)",
+      decoded.len()
+    )));
+  }
+  let mut key_bytes = [0u8; 32];
+  key_bytes.copy_from_slice(&decoded);
+  Ok(key_bytes)
+}
+
+fn parse_one_cidr(entry: &str) -> Result<(IpCidr, IpAddress), VpnError> {
+  let parts: Vec<&str> = entry.split('/').collect();
+  let ip_str = parts[0].trim();
+
+  let ip: std::net::IpAddr = ip_str
+    .parse()
+    .map_err(|_| VpnError::InvalidWireGuard(format!("Invalid IP address: {ip_str}")))?;
+
+  let prefix = if parts.len() > 1 {
+    parts[1]
+      .trim()
+      .parse::<u8>()
+      .map_err(|_| VpnError::InvalidWireGuard(format!("Invalid prefix length: {}", parts[1])))?
+  } else if ip.is_ipv6() {
+    128
+  } else {
+    32
+  };
+
+  match ip {
+    std::net::IpAddr::V4(v4) => {
+      let smol_ip = Ipv4Address::new(
+        v4.octets()[0],
+        v4.octets()[1],
+        v4.octets()[2],
+        v4.octets()[3],
+      );
+      Ok((
+        IpCidr::new(IpAddress::Ipv4(smol_ip), prefix),
+        IpAddress::Ipv4(smol_ip),
+      ))
+    }
+    std::net::IpAddr::V6(v6) => {
+      let smol_ip = smoltcp::wire::Ipv6Address::from(v6.octets());
+      Ok((
+        IpCidr::new(IpAddress::Ipv6(smol_ip), prefix),
+        IpAddress::Ipv6(smol_ip),
+      ))
+    }
+  }
+}
+
+/// Parse every address in a (comma-separated) WireGuard `Address` line. A
+/// dual-stack config yields both the IPv4 and IPv6 entries so the tunnel
+/// interface is addressed for each family it carries.
+fn parse_cidr_addresses(addr: &str) -> Result<Vec<(IpCidr, IpAddress)>, VpnError> {
+  let mut out = Vec::new();
+  for entry in addr.split(',') {
+    let entry = entry.trim();
+    if entry.is_empty() {
+      continue;
+    }
+    out.push(parse_one_cidr(entry)?);
+  }
+  if out.is_empty() {
+    return Err(VpnError::InvalidWireGuard(format!(
+      "No interface address in: {addr}"
+    )));
+  }
+  Ok(out)
+}
+
+/// Convert a smoltcp `IpAddress` to a std `IpAddr`. Both smoltcp address types
+/// are re-exports of `core::net`, so this is a straight variant map.
+fn smol_to_std_ip(ip: IpAddress) -> std::net::IpAddr {
+  match ip {
+    IpAddress::Ipv4(v4) => std::net::IpAddr::V4(v4),
+    IpAddress::Ipv6(v6) => std::net::IpAddr::V6(v6),
+  }
+}
+
+pub struct WireGuardSocks5Server {
+  config: WireGuardConfig,
+  port: u16,
+}
+
+impl WireGuardSocks5Server {
+  pub fn new(config: WireGuardConfig, port: u16) -> Self {
+    Self { config, port }
+  }
+
+  fn create_tunnel(&self) -> Result<Box<Tunn>, VpnError> {
+    let private_key_bytes = parse_key(&self.config.private_key)?;
+    let static_private = StaticSecret::from(private_key_bytes);
+
+    let peer_public_bytes = parse_key(&self.config.peer_public_key)?;
+    let peer_public = PublicKey::from(peer_public_bytes);
+
+    let preshared_key = if let Some(ref psk) = self.config.preshared_key {
+      Some(parse_key(psk)?)
+    } else {
+      None
+    };
+
+    Ok(Box::new(Tunn::new(
+      static_private,
+      peer_public,
+      preshared_key,
+      self.config.persistent_keepalive,
+      0,
+      None,
+    )))
+  }
+
+  fn resolve_endpoint(&self) -> Result<SocketAddr, VpnError> {
+    self
+      .config
+      .peer_endpoint
+      .to_socket_addrs()
+      .map_err(|e| {
+        VpnError::Connection(format!(
+          "Failed to resolve endpoint '{}': {e}",
+          self.config.peer_endpoint
+        ))
+      })?
+      .next()
+      .ok_or_else(|| {
+        VpnError::Connection(format!(
+          "No addresses found for endpoint: {}",
+          self.config.peer_endpoint
+        ))
+      })
+  }
+
+  fn do_handshake(
+    tunn: &mut Tunn,
+    socket: &UdpSocket,
+    peer_addr: SocketAddr,
+  ) -> Result<(), VpnError> {
+    socket
+      .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+      .map_err(|e| VpnError::Connection(format!("Failed to set timeout: {e}")))?;
+
+    // WireGuard handshakes use UDP which can silently lose packets, especially
+    // through Docker port-forwarding layers. Retry the handshake initiation up
+    // to 5 times (25s total) before giving up — the protocol is designed for
+    // retransmission and peers handle duplicate initiations correctly.
+    let max_attempts = 5;
+    let mut last_error = String::from("no handshake attempt completed");
+
+    for attempt in 1..=max_attempts {
+      let mut dst = vec![0u8; 2048];
+      let result = tunn.format_handshake_initiation(&mut dst, false);
+
+      match result {
+        TunnResult::WriteToNetwork(packet) => {
+          socket
+            .send_to(packet, peer_addr)
+            .map_err(|e| VpnError::Connection(format!("Failed to send handshake: {e}")))?;
+        }
+        TunnResult::Err(e) => {
+          return Err(VpnError::Tunnel(format!(
+            "Handshake initiation failed: {e:?}"
+          )));
+        }
+        _ => {}
+      }
+
+      let mut recv_buf = vec![0u8; 2048];
+      match socket.recv_from(&mut recv_buf) {
+        Ok((len, _)) => {
+          let result = tunn.decapsulate(None, &recv_buf[..len], &mut dst);
+          match result {
+            TunnResult::WriteToNetwork(response) => {
+              socket
+                .send_to(response, peer_addr)
+                .map_err(|e| VpnError::Connection(format!("Failed to send response: {e}")))?;
+            }
+            TunnResult::Done => {}
+            TunnResult::Err(e) => {
+              last_error = format!("handshake response error: {e:?}");
+              log::warn!(
+                "[vpn-worker] Handshake attempt {attempt}/{max_attempts} failed: {last_error}"
+              );
+              continue;
+            }
+            _ => {}
+          }
+
+          socket
+            .set_read_timeout(None)
+            .map_err(|e| VpnError::Connection(format!("Failed to clear timeout: {e}")))?;
+          return Ok(());
+        }
+        Err(e) if attempt < max_attempts => {
+          log::warn!(
+            "[vpn-worker] Handshake attempt {attempt}/{max_attempts} timed out: {e}, retrying"
+          );
+          last_error = format!("timeout: {e}");
+          continue;
+        }
+        Err(e) => {
+          last_error = format!("timeout: {e}");
+        }
+      }
+    }
+
+    Err(VpnError::Connection(format!(
+      "Handshake failed after {max_attempts} attempts: {last_error}"
+    )))
+  }
+
+  pub async fn run(
+    self,
+    config_id: String,
+    config_path: Option<std::path::PathBuf>,
+  ) -> Result<(), VpnError> {
+    let peer_addr = self.resolve_endpoint()?;
+    let mut tunn = self.create_tunnel()?;
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")
+      .map_err(|e| VpnError::Connection(format!("Failed to create UDP socket: {e}")))?;
+
+    Self::do_handshake(&mut tunn, &udp_socket, peer_addr)?;
+
+    udp_socket
+      .set_nonblocking(true)
+      .map_err(|e| VpnError::Connection(format!("Failed to set non-blocking: {e}")))?;
+
+    log::info!("[vpn-worker] WireGuard handshake completed");
+
+    let local_addrs = parse_cidr_addresses(&self.config.address)?;
+
+    let tunn_arc = Arc::new(Mutex::new(tunn));
+    let udp_arc = Arc::new(udp_socket);
+
+    let mut device = WgDevice {
+      tunn: tunn_arc.clone(),
+      udp_socket: udp_arc.clone(),
+      peer_addr,
+      rx_queue: VecDeque::new(),
+      tx_queue: VecDeque::new(),
+    };
+
+    let iface_config = IfaceConfig::new(HardwareAddress::Ip);
+    let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+    iface.update_ip_addrs(|addrs| {
+      for (cidr, _) in &local_addrs {
+        let _ = addrs.push(*cidr);
+      }
+    });
+
+    // Install a default route for every address family the tunnel carries.
+    // WireGuard is a routed (Medium::Ip) link, so the gateway is nominal — there
+    // is no L2/neighbor resolution; smoltcp only uses it to select the default
+    // route and then hands the packet straight to the WgDevice. The gateway is
+    // derived from the interface address (x.x.x.1 / …::1) purely for form.
+    let has_ipv4 = local_addrs
+      .iter()
+      .any(|(_, ip)| matches!(ip, IpAddress::Ipv4(_)));
+    let has_ipv6 = local_addrs
+      .iter()
+      .any(|(_, ip)| matches!(ip, IpAddress::Ipv6(_)));
+    for (_, ip) in &local_addrs {
+      match ip {
+        IpAddress::Ipv4(v4) => {
+          let o = v4.octets();
+          let gw = Ipv4Address::new(o[0], o[1], o[2], 1);
+          iface
+            .routes_mut()
+            .add_default_ipv4_route(gw)
+            .map_err(|e| VpnError::Tunnel(format!("Failed to add default IPv4 route: {e}")))?;
+        }
+        IpAddress::Ipv6(v6) => {
+          let mut o = v6.octets();
+          o[14] = 0;
+          o[15] = 1;
+          let gw = smoltcp::wire::Ipv6Address::from(o);
+          iface
+            .routes_mut()
+            .add_default_ipv6_route(gw)
+            .map_err(|e| VpnError::Tunnel(format!("Failed to add default IPv6 route: {e}")))?;
+        }
+      }
+    }
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port))
+      .await
+      .map_err(|e| VpnError::Connection(format!("Failed to bind SOCKS5 listener: {e}")))?;
+
+    let actual_port = listener
+      .local_addr()
+      .map_err(|e| VpnError::Connection(format!("Failed to get local addr: {e}")))?
+      .port();
+
+    // Update config with actual port and local_url. Prefer the explicit
+    // config path the worker was started with — a case where
+    // get_storage_dir() in the worker process resolved to a different
+    // directory than in the parent (Qubes/sandboxed Linux), causing the
+    // write-back to land in the wrong place and the parent to time out.
+    let updated = match &config_path {
+      Some(path) => crate::vpn_worker_storage::get_vpn_worker_config_from_path(path)
+        .or_else(|| crate::vpn_worker_storage::get_vpn_worker_config(&config_id)),
+      None => crate::vpn_worker_storage::get_vpn_worker_config(&config_id),
+    };
+    if let Some(mut wc) = updated {
+      wc.local_port = Some(actual_port);
+      wc.local_url = Some(format!("socks5://127.0.0.1:{}", actual_port));
+      let result = match &config_path {
+        Some(path) => crate::vpn_worker_storage::save_vpn_worker_config_to_path(&wc, path)
+          .map_err(|e| e.to_string()),
+        None => crate::vpn_worker_storage::save_vpn_worker_config(&wc).map_err(|e| e.to_string()),
+      };
+      if let Err(e) = result {
+        log::error!(
+          "[vpn-worker] Failed to write back local_url to config: {} (path={:?})",
+          e,
+          config_path
+        );
+      }
+    } else {
+      log::error!(
+        "[vpn-worker] Could not load worker config for write-back (id={}, path={:?})",
+        config_id,
+        config_path
+      );
+    }
+
+    log::info!(
+      "[vpn-worker] SOCKS5 server listening on 127.0.0.1:{}",
+      actual_port
+    );
+
+    // DNS resolution for domain-name CONNECT requests must go THROUGH the tunnel, never
+    // the host resolver (which would leak the query to the local network — the
+    // whole point of the VPN). Resolve via the WireGuard config's DNS server
+    // (default 1.1.1.1, still routed through the tunnel). `dns_servers` must
+    // outlive `sockets` since the socket borrows it, so declare it first.
+    let dns_servers = [self
+      .config
+      .dns
+      .as_deref()
+      .and_then(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+      .map(|v4| {
+        let o = v4.octets();
+        IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+      })
+      .unwrap_or_else(|| IpAddress::Ipv4(Ipv4Address::new(1, 1, 1, 1)))];
+
+    let mut sockets = SocketSet::new(vec![]);
+
+    // Single DNS socket shared by all connections; queries are driven through
+    // the tunnel by iface.poll like every other socket. Build the query storage
+    // without vec![None; N] since DnsQuery isn't Clone.
+    let dns_queries: Vec<Option<dns::DnsQuery>> = (0..64).map(|_| None).collect();
+    let dns_socket = dns::Socket::new(&dns_servers, dns_queries);
+    let dns_handle = sockets.add(dns_socket);
+
+    // A live SOCKS5 UDP ASSOCIATE: the loopback relay socket the browser sends
+    // datagrams to, and the browser's learned source address. The tunnel-side
+    // smoltcp UDP socket lives in `sockets`, keyed by the connection's
+    // (repurposed) `smol_handle`.
+    struct UdpAssoc {
+      relay: UdpSocket,
+      client_addr: Option<SocketAddr>,
+    }
+
+    // An in-flight through-tunnel DNS resolution for a domain-name CONNECT.
+    struct PendingDns {
+      query: dns::QueryHandle,
+      port: u16,
+      domain: String,
+      // true if this is an AAAA query (resolving to IPv6); false for A.
+      want_ipv6: bool,
+      // whether we've already retried with the other address family.
+      fell_back: bool,
+    }
+
+    struct Connection {
+      smol_handle: SocketHandle,
+      tcp_stream: TcpStream,
+      socks_done: bool,
+      connecting: bool,
+      greeting_done: bool,
+      read_buf: Vec<u8>,
+      dest_addr: Option<SocketAddr>,
+      udp: Option<UdpAssoc>,
+      pending_dns: Option<PendingDns>,
+    }
+
+    let mut connections: Vec<Connection> = Vec::new();
+    let mut timer_counter: u64 = 0;
+
+    loop {
+      // Accept new SOCKS5 connections (non-blocking via short timeout)
+      if let Ok(Ok((stream, _addr))) =
+        tokio::time::timeout(tokio::time::Duration::from_millis(1), listener.accept()).await
+      {
+        let tcp_rx = SocketBuffer::new(vec![0u8; SMOLTCP_TCP_RX_BUF]);
+        let tcp_tx = SocketBuffer::new(vec![0u8; SMOLTCP_TCP_TX_BUF]);
+        let tcp_socket = TcpSocket::new(tcp_rx, tcp_tx);
+        let handle = sockets.add(tcp_socket);
+
+        connections.push(Connection {
+          smol_handle: handle,
+          tcp_stream: stream,
+          socks_done: false,
+          connecting: false,
+          greeting_done: false,
+          read_buf: Vec::new(),
+          dest_addr: None,
+          udp: None,
+          pending_dns: None,
+        });
+      }
+
+      // Pump WireGuard packets into smoltcp rx queue
+      device.pump_wg_to_rx();
+
+      // Poll the smoltcp interface
+      let timestamp = SmolInstant::now();
+      let _changed = iface.poll(timestamp, &mut device, &mut sockets);
+
+      // Flush encrypted packets out through WireGuard
+      device.flush_tx_queue();
+
+      // Process each connection
+      let mut completed = Vec::new();
+      for (idx, conn) in connections.iter_mut().enumerate() {
+        if let Some(pending) = conn.pending_dns.take() {
+          // A through-tunnel DNS resolution is in flight for this connection.
+          let result = {
+            let dns_sock = sockets.get_mut::<dns::Socket>(dns_handle);
+            dns_sock.get_query_result(pending.query)
+          };
+
+          // Classify: a usable address of the queried family, a clean "no such
+          // record", still-pending, or a hard failure.
+          enum DnsOutcome {
+            Resolved(IpAddress),
+            NoRecord,
+            Pending,
+            Failed,
+          }
+          let outcome = match result {
+            Ok(addrs) => {
+              let want_ipv6 = pending.want_ipv6;
+              match addrs.iter().copied().find(|a| {
+                matches!(
+                  (a, want_ipv6),
+                  (IpAddress::Ipv4(_), false) | (IpAddress::Ipv6(_), true)
+                )
+              }) {
+                Some(ip) => DnsOutcome::Resolved(ip),
+                None => DnsOutcome::NoRecord,
+              }
+            }
+            Err(dns::GetQueryResultError::Pending) => DnsOutcome::Pending,
+            Err(_) => DnsOutcome::Failed,
+          };
+
+          match outcome {
+            DnsOutcome::Pending => {
+              // Still resolving; put it back and check again next poll.
+              conn.pending_dns = Some(pending);
+            }
+            DnsOutcome::Resolved(ip) => {
+              conn.dest_addr = Some(SocketAddr::new(smol_to_std_ip(ip), pending.port));
+              let socket = sockets.get_mut::<TcpSocket>(conn.smol_handle);
+              let local_port = 10000 + (rand::random::<u16>() % 50000);
+              if socket
+                .connect(iface.context(), (ip, pending.port), local_port)
+                .is_err()
+              {
+                let _ = conn
+                  .tcp_stream
+                  .try_write(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                completed.push(idx);
+                continue;
+              }
+              conn.connecting = true;
+            }
+            DnsOutcome::NoRecord | DnsOutcome::Failed => {
+              // No record for this family (or the query failed). Retry once with
+              // the other family if the tunnel carries it — a dual-stack name
+              // that only had the other record, or an IPv4-preferred query for
+              // an IPv6-only name.
+              let other_ipv6 = !pending.want_ipv6;
+              let other_supported = if other_ipv6 { has_ipv6 } else { has_ipv4 };
+              let mut requeued = false;
+              if !pending.fell_back && other_supported {
+                let qtype = if other_ipv6 {
+                  smoltcp::wire::DnsQueryType::Aaaa
+                } else {
+                  smoltcp::wire::DnsQueryType::A
+                };
+                let dns_sock = sockets.get_mut::<dns::Socket>(dns_handle);
+                if let Ok(query) = dns_sock.start_query(iface.context(), &pending.domain, qtype) {
+                  conn.pending_dns = Some(PendingDns {
+                    query,
+                    port: pending.port,
+                    domain: pending.domain,
+                    want_ipv6: other_ipv6,
+                    fell_back: true,
+                  });
+                  requeued = true;
+                }
+              }
+              if !requeued {
+                let _ = conn
+                  .tcp_stream
+                  .try_write(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                completed.push(idx);
+                continue;
+              }
+            }
+          }
+        } else if conn.connecting {
+          let socket = sockets.get_mut::<TcpSocket>(conn.smol_handle);
+          if socket.may_send() {
+            let _ = conn.tcp_stream.try_write(&[
+              0x05,
+              0x00,
+              0x00,
+              0x01,
+              127,
+              0,
+              0,
+              1,
+              (actual_port >> 8) as u8,
+              (actual_port & 0xff) as u8,
+            ]);
+            conn.connecting = false;
+            conn.socks_done = true;
+          } else if !socket.is_open() {
+            let _ = conn
+              .tcp_stream
+              .try_write(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            completed.push(idx);
+          }
+        } else if !conn.socks_done {
+          // Handle SOCKS5 handshake
+          let mut buf = [0u8; 512];
+          match conn.tcp_stream.try_read(&mut buf) {
+            Ok(0) => {
+              completed.push(idx);
+              continue;
+            }
+            Ok(n) => {
+              conn.read_buf.extend_from_slice(&buf[..n]);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+              completed.push(idx);
+              continue;
+            }
+          }
+
+          if !conn.greeting_done && conn.read_buf.len() >= 3 {
+            // SOCKS5 greeting: version, nmethods, methods
+            if conn.read_buf[0] != 0x05 {
+              completed.push(idx);
+              continue;
+            }
+            let nmethods = conn.read_buf[1] as usize;
+            if conn.read_buf.len() < 2 + nmethods {
+              continue;
+            }
+            // Reply: no auth required
+            if conn.tcp_stream.try_write(&[0x05, 0x00]).is_err() {
+              completed.push(idx);
+              continue;
+            }
+            conn.read_buf.drain(..2 + nmethods);
+            conn.greeting_done = true;
+          }
+
+          if conn.greeting_done && conn.dest_addr.is_none() && conn.read_buf.len() >= 10 {
+            // SOCKS5 request: CONNECT (0x01) or UDP ASSOCIATE (0x03)
+            if conn.read_buf[0] != 0x05 {
+              completed.push(idx);
+              continue;
+            }
+            let cmd = conn.read_buf[1];
+            if cmd != 0x01 && cmd != 0x03 {
+              // command not supported
+              let _ = conn
+                .tcp_stream
+                .try_write(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+              completed.push(idx);
+              continue;
+            }
+
+            let (addr, addr_len) = match conn.read_buf[3] {
+              0x01 => {
+                // IPv4
+                if conn.read_buf.len() < 10 {
+                  continue;
+                }
+                let ip = std::net::Ipv4Addr::new(
+                  conn.read_buf[4],
+                  conn.read_buf[5],
+                  conn.read_buf[6],
+                  conn.read_buf[7],
+                );
+                let port = u16::from_be_bytes([conn.read_buf[8], conn.read_buf[9]]);
+                (SocketAddr::new(std::net::IpAddr::V4(ip), port), 10)
+              }
+              0x03 => {
+                // Domain name
+                let domain_len = conn.read_buf[4] as usize;
+                let needed = 4 + 1 + domain_len + 2;
+                if conn.read_buf.len() < needed {
+                  continue;
+                }
+                let domain = String::from_utf8_lossy(&conn.read_buf[5..5 + domain_len]).to_string();
+                let port_start = 5 + domain_len;
+                let port =
+                  u16::from_be_bytes([conn.read_buf[port_start], conn.read_buf[port_start + 1]]);
+                if cmd == 0x03 {
+                  // UDP ASSOCIATE ignores the DST address (the relay learns the
+                  // client's source from its first datagram), so no resolution
+                  // is needed — never resolve it on the host.
+                  (
+                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
+                    needed,
+                  )
+                } else {
+                  // TCP CONNECT: resolve the domain THROUGH THE TUNNEL via the
+                  // config DNS server, never the host resolver (which would leak
+                  // the query onto the local network). Prefer IPv4 when the
+                  // tunnel carries it (the well-tested path) and fall back to
+                  // AAAA only for names with no A record; an IPv6-only tunnel
+                  // resolves AAAA directly. Start an async query and defer the
+                  // connection until it resolves.
+                  conn.read_buf.drain(..needed);
+                  let want_ipv6 = !has_ipv4;
+                  let qtype = if want_ipv6 {
+                    smoltcp::wire::DnsQueryType::Aaaa
+                  } else {
+                    smoltcp::wire::DnsQueryType::A
+                  };
+                  let dns_sock = sockets.get_mut::<dns::Socket>(dns_handle);
+                  match dns_sock.start_query(iface.context(), &domain, qtype) {
+                    Ok(query) => {
+                      conn.pending_dns = Some(PendingDns {
+                        query,
+                        port,
+                        domain,
+                        want_ipv6,
+                        fell_back: false,
+                      });
+                    }
+                    Err(e) => {
+                      log::warn!(
+                        "[vpn-worker] Failed to start DNS query for {}: {:?}",
+                        domain,
+                        e
+                      );
+                      let _ = conn
+                        .tcp_stream
+                        .try_write(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                      completed.push(idx);
+                    }
+                  }
+                  continue;
+                }
+              }
+              0x04 => {
+                // IPv6-literal CONNECT. Route it through the tunnel when the
+                // tunnel carries IPv6; otherwise it can never be reached (no
+                // IPv6 address/route), so fail fast with "host unreachable"
+                // rather than letting the smoltcp socket sit in SynSent until it
+                // times out (a visible hang).
+                if conn.read_buf.len() < 22 {
+                  continue;
+                }
+                if !has_ipv6 {
+                  let _ = conn
+                    .tcp_stream
+                    .try_write(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                  completed.push(idx);
+                  continue;
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&conn.read_buf[4..20]);
+                let ip = std::net::Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([conn.read_buf[20], conn.read_buf[21]]);
+                (SocketAddr::new(std::net::IpAddr::V6(ip), port), 22)
+              }
+              _ => {
+                completed.push(idx);
+                continue;
+              }
+            };
+
+            conn.read_buf.drain(..addr_len);
+
+            if cmd == 0x03 {
+              // === SOCKS5 UDP ASSOCIATE ===
+              // The request's DST is the client's intended source (typically
+              // 0.0.0.0:0) and is ignored — the browser's relay source is
+              // learned from its first datagram. Bind a loopback relay socket
+              // the browser sends to, plus a smoltcp UDP socket that egresses
+              // through the WireGuard tunnel on the interface IP.
+              let relay = match UdpSocket::bind("127.0.0.1:0") {
+                Ok(s) => s,
+                Err(_) => {
+                  let _ = conn
+                    .tcp_stream
+                    .try_write(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                  completed.push(idx);
+                  continue;
+                }
+              };
+              let _ = relay.set_nonblocking(true);
+              let relay_port = relay.local_addr().map(|a| a.port()).unwrap_or(0);
+
+              // Reply with the relay endpoint (127.0.0.1:relay_port).
+              if conn
+                .tcp_stream
+                .try_write(&[
+                  0x05,
+                  0x00,
+                  0x00,
+                  0x01,
+                  127,
+                  0,
+                  0,
+                  1,
+                  (relay_port >> 8) as u8,
+                  (relay_port & 0xff) as u8,
+                ])
+                .is_err()
+              {
+                completed.push(idx);
+                continue;
+              }
+
+              let udp_rx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 32],
+                vec![0u8; SMOLTCP_UDP_BUF],
+              );
+              let udp_tx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 32],
+                vec![0u8; SMOLTCP_UDP_BUF],
+              );
+              let mut udp_socket = udp::Socket::new(udp_rx, udp_tx);
+              let local_port = 20000 + (rand::random::<u16>() % 40000);
+              if udp_socket.bind(local_port).is_err() {
+                completed.push(idx);
+                continue;
+              }
+
+              // Swap this connection's unused TCP socket for the UDP socket;
+              // `smol_handle` now keys the UDP socket, so teardown is unchanged.
+              sockets.remove(conn.smol_handle);
+              conn.smol_handle = sockets.add(udp_socket);
+              conn.udp = Some(UdpAssoc {
+                relay,
+                client_addr: None,
+              });
+              conn.socks_done = true;
+              continue;
+            }
+
+            conn.dest_addr = Some(addr);
+
+            // Open smoltcp TCP socket to the destination
+            let socket = sockets.get_mut::<TcpSocket>(conn.smol_handle);
+            let smol_addr = match addr.ip() {
+              std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]))
+              }
+              std::net::IpAddr::V6(v6) => {
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(v6.octets()))
+              }
+            };
+
+            let local_port = 10000 + (rand::random::<u16>() % 50000);
+            if socket
+              .connect(iface.context(), (smol_addr, addr.port()), local_port)
+              .is_err()
+            {
+              let _ = conn
+                .tcp_stream
+                .try_write(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+              completed.push(idx);
+              continue;
+            }
+
+            conn.connecting = true;
+          }
+        } else if conn.udp.is_some() {
+          // === UDP ASSOCIATE relay ===
+          // The association lives only while the TCP control connection is
+          // open (RFC 1928 §6); tear down when the browser closes it.
+          let mut probe = [0u8; 1];
+          match conn.tcp_stream.try_read(&mut probe) {
+            Ok(0) => {
+              completed.push(idx);
+              continue;
+            }
+            Ok(_) => {} // ignore any data on the control channel
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+              completed.push(idx);
+              continue;
+            }
+          }
+
+          let handle = conn.smol_handle;
+          let Some(udp) = conn.udp.as_mut() else {
+            continue;
+          };
+
+          // Browser → tunnel: strip the §7 header and forward the payload.
+          let mut dbuf = [0u8; SMOLTCP_UDP_BUF];
+          loop {
+            match udp.relay.recv_from(&mut dbuf) {
+              Ok((n, src)) => {
+                udp.client_addr = Some(src);
+                if let Some((dst, off)) = parse_udp_datagram(&dbuf[..n]) {
+                  let socket = sockets.get_mut::<udp::Socket>(handle);
+                  if socket.can_send() {
+                    let _ = socket.send_slice(&dbuf[off..n], dst);
+                  }
+                }
+              }
+              Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+              Err(_) => break,
+            }
+          }
+
+          // Tunnel → browser: wrap each datagram in a §7 header and relay back.
+          loop {
+            let socket = sockets.get_mut::<udp::Socket>(handle);
+            if !socket.can_recv() {
+              break;
+            }
+            let (payload, src) = match socket.recv() {
+              Ok((data, meta)) => (data.to_vec(), meta.endpoint),
+              Err(_) => break,
+            };
+            if let Some(client) = udp.client_addr {
+              let resp = build_udp_datagram(src, &payload);
+              let _ = udp.relay.send_to(&resp, client);
+            }
+          }
+        } else {
+          // Data relay between SOCKS5 client and smoltcp socket
+          let socket = sockets.get_mut::<TcpSocket>(conn.smol_handle);
+
+          // Client → smoltcp
+          let mut buf = [0u8; 4096];
+          match conn.tcp_stream.try_read(&mut buf) {
+            Ok(0) => {
+              socket.close();
+              completed.push(idx);
+              continue;
+            }
+            Ok(n) => {
+              if socket.can_send() {
+                let _ = socket.send_slice(&buf[..n]);
+              }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+              socket.close();
+              completed.push(idx);
+              continue;
+            }
+          }
+
+          // smoltcp → Client
+          if socket.can_recv() {
+            match socket.recv(|data| (data.len(), data.to_vec())) {
+              Ok(data) if !data.is_empty() && conn.tcp_stream.try_write(&data).is_err() => {
+                socket.close();
+                completed.push(idx);
+                continue;
+              }
+              _ => {}
+            }
+          }
+
+          // Check if smoltcp socket closed
+          if !socket.is_open() && !socket.is_active() {
+            completed.push(idx);
+          }
+        }
+      }
+
+      // Remove completed connections (in reverse order)
+      completed.sort_unstable();
+      completed.dedup();
+      for idx in completed.into_iter().rev() {
+        let conn = connections.remove(idx);
+        if let Some(pending) = conn.pending_dns {
+          sockets
+            .get_mut::<dns::Socket>(dns_handle)
+            .cancel_query(pending.query);
+        }
+        sockets.remove(conn.smol_handle);
+      }
+
+      // Timer ticks for WireGuard keepalives
+      timer_counter += 1;
+      if timer_counter.is_multiple_of(500) {
+        device.tick_timers();
+      }
+
+      // Small sleep to avoid busy-spinning
+      tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_parse_cidr_ipv4() {
+    let (cidr, ip) = parse_one_cidr("10.0.0.2/24").unwrap();
+    assert_eq!(cidr.prefix_len(), 24);
+    assert_eq!(ip, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)));
+  }
+
+  #[test]
+  fn test_parse_cidr_no_prefix() {
+    let (cidr, _) = parse_one_cidr("10.0.0.2").unwrap();
+    assert_eq!(cidr.prefix_len(), 32);
+  }
+
+  #[test]
+  fn test_parse_cidr_ipv6_default_prefix() {
+    let (cidr, ip) = parse_one_cidr("fd00::2").unwrap();
+    assert_eq!(cidr.prefix_len(), 128);
+    assert!(matches!(ip, IpAddress::Ipv6(_)));
+  }
+
+  #[test]
+  fn test_parse_cidr_addresses_dual_stack() {
+    let addrs = parse_cidr_addresses("10.0.0.2/24, fd00::2/128").unwrap();
+    assert_eq!(addrs.len(), 2);
+    assert_eq!(addrs[0].1, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)));
+    assert!(matches!(addrs[1].1, IpAddress::Ipv6(_)));
+    assert!(addrs.iter().any(|(_, ip)| matches!(ip, IpAddress::Ipv4(_))));
+    assert!(addrs.iter().any(|(_, ip)| matches!(ip, IpAddress::Ipv6(_))));
+  }
+
+  #[test]
+  fn test_parse_key_valid() {
+    let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    assert!(parse_key(key).is_ok());
+  }
+
+  #[test]
+  fn test_parse_key_invalid() {
+    assert!(parse_key("not-valid").is_err());
+  }
+}

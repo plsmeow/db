@@ -1,0 +1,85 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Donut",
+  "version": "0.29.5",
+  "identifier": "com.donutbrowser",
+  "build": {
+    "beforeDevCommand": "pnpm copy-proxy-binary && pnpm dev",
+    "devUrl": "http://localhost:12341",
+    "beforeBuildCommand": "pnpm copy-proxy-binary:release && pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": {
+        "default-src": "'self' customprotocol: asset:",
+        "connect-src": "ipc: http://ipc.localhost http: https: ws: wss:",
+        "font-src": "'self' data:",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "style-src": "'self' 'unsafe-inline'",
+        "script-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "nsis", "deb", "rpm", "appimage"],
+    "category": "Productivity",
+    "externalBin": ["binaries/donut-proxy", "binaries/xray"],
+    "resources": {
+      "binaries/xray-LICENSE.txt": "licenses/Xray-core-LICENSE.txt"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.13",
+      "exceptionDomain": "",
+      "signingIdentity": null,
+      "providerShortName": null,
+      "entitlements": "entitlements.plist",
+      "infoPlist": "Info.plist"
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "donutbrowser.desktop",
+        "depends": ["xdg-utils", "libxdo3", "libayatana-appindicator3-1"]
+      },
+      "rpm": {
+        "desktopTemplate": "donutbrowser.desktop",
+        "depends": ["xdg-utils", "libxdo", "libayatana-appindicator-gtk3"]
+      },
+      "appimage": {
+        "files": {
+          "usr/share/applications/donutbrowser.desktop": "donutbrowser.desktop"
+        }
+      }
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["http", "https"]
+      }
+    }
+  }
+}

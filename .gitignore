@@ -1,0 +1,73 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# npm/yarn lock files (project uses pnpm only)
+**/package-lock.json
+**/yarn.lock
+
+# testing
+/coverage
+/e2e/app/target/
+/e2e/.driver/
+
+# next.js
+/.next/
+/out/
+/dist/
+
+# production
+/build
+
+# misc
+**/*.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# nodecar
+**/dist
+**/node_modules
+
+# local env files
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+!**/.gitkeep
+
+# nodecar
+nodecar/nodecar-bin
+
+# sync test harness cache
+.cache/
+
+# env
+.env
+
+# next
+**/next-env.d.ts
+
+# claude
+.claude/
+# Claude Code session-recovery runtime state
+HANDOFF.md
+.claude/settings.local.json
+.claude/rate-limit-state.json
+.claude/stop-failure-events.jsonl
+.claude/quota-blocked.json
+session-recover.yaml

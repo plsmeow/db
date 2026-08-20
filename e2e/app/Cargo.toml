@@ -1,0 +1,9 @@
+[package]
+name = "donutbrowser-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+donutbrowser-lib = { package = "donutbrowser", path = "../../src-tauri", features = ["e2e"] }
+tauri-wd = "=0.1.11"

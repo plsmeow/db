@@ -1,0 +1,60 @@
+name: "CodeQL"
+
+on:
+  workflow_call: {}
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "16 13 * * 5"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Set up pnpm package manager
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 #v6.0.10
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: "pnpm"
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@b1e4dc3db58c9601794e22a9f6d28d45461b9dbf #v3.29.0
+        with:
+          queries: security-extended
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@b1e4dc3db58c9601794e22a9f6d28d45461b9dbf #v3.29.0
+        with:
+          category: "/language:${{matrix.language}}"

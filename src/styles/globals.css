@@ -1,0 +1,319 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --animate-progress-indeterminate: progress-indeterminate 1.4s ease-in-out
+    infinite;
+
+  @keyframes progress-indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(300%);
+    }
+  }
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-text: var(--primary-text);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-text: var(--destructive-text);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-text: var(--success-text);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-text: var(--warning-text);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 0.625rem;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.141 0.005 285.823);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.141 0.005 285.823);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.141 0.005 285.823);
+  --primary: oklch(0.21 0.006 285.885);
+  --primary-foreground: oklch(0.985 0 0);
+  --primary-text: oklch(0.21 0.006 285.885);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.967 0.001 286.375);
+  --muted-foreground: oklch(0.552 0.016 285.938);
+  --accent: oklch(0.967 0.001 286.375);
+  --accent-foreground: oklch(0.21 0.006 285.885);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --destructive-text: #b91c1c;
+  --success: oklch(0.6 0.2 145);
+  --success-foreground: oklch(0.985 0 0);
+  --success-text: #15753a;
+  --warning: oklch(0.75 0.15 75);
+  --warning-foreground: oklch(0.141 0.005 285.823);
+  --warning-text: #854d0e;
+  --border: oklch(0.92 0.004 286.32);
+  --input: oklch(0.92 0.004 286.32);
+  --ring: oklch(0.705 0.015 286.067);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.141 0.005 285.823);
+  --sidebar-primary: oklch(0.21 0.006 285.885);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.967 0.001 286.375);
+  --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
+  --sidebar-border: oklch(0.92 0.004 286.32);
+  --sidebar-ring: oklch(0.705 0.015 286.067);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+}
+
+.dark {
+  /* Donut Mono — redesign monochrome palette */
+  --background: #070707;
+  --foreground: #ffffff;
+  --card: #0e0e0e;
+  --card-foreground: #e4e4e4;
+  --popover: #0e0e0e;
+  --popover-foreground: #e4e4e4;
+  --primary: #ffffff;
+  --primary-foreground: #070707;
+  --primary-text: #ffffff;
+  --secondary: #161616;
+  --secondary-foreground: #e4e4e4;
+  --muted: #161616;
+  --muted-foreground: #a0a0a0;
+  --accent: #1f1f1f;
+  --accent-foreground: #ffffff;
+  --destructive: #ec6a5e;
+  --destructive-foreground: #070707;
+  --destructive-text: #ec6a5e;
+  --success: #61c554;
+  --success-foreground: #070707;
+  --success-text: #61c554;
+  --warning: #f4be4f;
+  --warning-foreground: #070707;
+  --warning-text: #f4be4f;
+  --border: rgba(255, 255, 255, 0.06);
+  --input: rgba(255, 255, 255, 0.1);
+  --ring: #6b6b6b;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.21 0.006 285.885);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.274 0.006 286.033);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.552 0.016 285.938);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    /* Thin, transparent-background scrollbars that look consistent across
+       Windows, macOS, and Linux. */
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.5 0 0 / 30%) transparent;
+  }
+  .dark * {
+    scrollbar-color: oklch(0.8 0 0 / 25%) transparent;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* Keep pointer behavior consistent; explicit cursor utilities still override
+     this base rule. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"],
+  [role="menuitemcheckbox"],
+  [role="menuitemradio"],
+  [role="option"],
+  [role="radio"],
+  [role="tab"],
+  [role="switch"] {
+    cursor: pointer;
+  }
+}
+
+/* Scroll-fade utility: a vertical mask that thins the alpha of the top and
+   bottom 24px of the scroll container ONLY when that direction is actually
+   scrollable. useScrollFade() writes `data-fade-top` / `data-fade-bottom`
+   on the container as the user scrolls; each attribute toggles its own
+   end of the mask via a CSS variable.
+
+   Mask is preferred over a colored gradient overlay: an overlay paints
+   bg-color over content, which leaves a visible band wherever content
+   passes through it. Mask just fades alpha — content gracefully fades to
+   nothing at the edges.
+
+   `--scroll-fade-top-offset` pushes the top-edge fade band down by N
+   pixels so a sticky table header stays fully opaque and only the body
+   rows scrolling past it fade. Set it inline on a scroll container whose
+   first N px are occupied by sticky chrome. */
+.scroll-fade {
+  --top-mask: black;
+  --bottom-mask: black;
+  --scroll-fade-top-offset: 0px;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    black 0,
+    black var(--scroll-fade-top-offset),
+    var(--top-mask) var(--scroll-fade-top-offset),
+    black calc(var(--scroll-fade-top-offset) + 24px),
+    black calc(100% - 24px),
+    var(--bottom-mask)
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    black 0,
+    black var(--scroll-fade-top-offset),
+    var(--top-mask) var(--scroll-fade-top-offset),
+    black calc(var(--scroll-fade-top-offset) + 24px),
+    black calc(100% - 24px),
+    var(--bottom-mask)
+  );
+}
+.scroll-fade[data-fade-top="true"] {
+  --top-mask: transparent;
+}
+.scroll-fade[data-fade-bottom="true"] {
+  --bottom-mask: transparent;
+}
+
+/* Ensure Sonner toasts appear above all dialogs and remain interactive */
+.toaster,
+[data-sonner-toaster] {
+  z-index: 99999;
+  pointer-events: auto;
+}
+
+[data-sonner-toast] {
+  z-index: 99999;
+  pointer-events: auto;
+}
+
+/* Ensure toast buttons and interactive elements work */
+[data-sonner-toast] button,
+[data-sonner-toast] [role="button"],
+[data-sonner-toast] input,
+[data-sonner-toast] select {
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+    scroll-behavior: auto;
+  }
+}
+
+/* Theme switches run inside a View Transition (see themes.ts
+   withThemeTransition) — a short whole-page cross-fade instead of an abrupt
+   palette jump. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 200ms;
+}
+
+/* Translucent material for floating chrome (modals, popovers, menus).
+   Uses theme variables so it adapts to every theme; falls back to the solid
+   surface when the user prefers reduced transparency. Never stack two
+   material surfaces on top of each other. */
+.surface-material {
+  background-color: color-mix(in oklab, var(--background) 85%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  backdrop-filter: blur(20px) saturate(1.4);
+}
+
+.surface-material-popover {
+  background-color: color-mix(in oklab, var(--popover) 85%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  backdrop-filter: blur(20px) saturate(1.4);
+}
+
+.surface-material-card {
+  background-color: color-mix(in oklab, var(--card) 85%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  backdrop-filter: blur(20px) saturate(1.4);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .surface-material {
+    background-color: var(--background);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .surface-material-popover {
+    background-color: var(--popover);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .surface-material-card {
+    background-color: var(--card);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

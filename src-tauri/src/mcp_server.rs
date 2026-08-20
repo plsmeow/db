@@ -1,0 +1,6636 @@
+use axum::{
+  body::Body,
+  extract::State,
+  http::{header, Request, StatusCode},
+  middleware::{self, Next},
+  response::{IntoResponse, Response},
+  routing::{get, post},
+  Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::Arc;
+use tauri::AppHandle;
+use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
+
+use crate::browser::ProxySettings;
+use crate::cdp_target::{CdpError, CdpTarget};
+use crate::cloud_auth::CLOUD_AUTH;
+use crate::group_manager::GROUP_MANAGER;
+use crate::profile::{BrowserProfile, ProfileManager};
+use crate::proxy_manager::PROXY_MANAGER;
+use crate::settings_manager::SettingsManager;
+use crate::wayfern_terms::WayfernTermsManager;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpTool {
+  pub name: String,
+  pub description: String,
+  pub input_schema: serde_json::Value,
+}
+
+/// JavaScript executed in the target page to enumerate visible interactive
+/// elements. Returns a JSON string `{elements, count, truncated}` where
+/// `elements` is the newline-joined labeled list. Live references are stashed
+/// on `window.__donut_interactive` so subsequent `click_by_index` /
+/// `type_by_index` calls can resolve `index → Element` without round-tripping
+/// a selector. `__MAX_CHARS__` is substituted at call time.
+const INTERACTIVE_ELEMENTS_JS: &str = r#"(() => {
+  const SELECTORS = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [role="combobox"], [role="option"], [contenteditable=""], [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+  const ATTRS = ['type','name','id','role','aria-label','aria-checked','aria-expanded','placeholder','title','value','href','alt'];
+  const MAX_CHARS = __MAX_CHARS__;
+  const interactive = [];
+  const lines = [];
+  let truncated = false;
+  let total = 0;
+  const nodes = document.querySelectorAll(SELECTORS);
+  for (const el of nodes) {
+    if (el.disabled) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+    const tag = el.tagName.toLowerCase();
+    const parts = [];
+    for (const a of ATTRS) {
+      const v = el.getAttribute(a);
+      if (v) parts.push(a + '="' + String(v).slice(0,100).replace(/"/g,'\\"') + '"');
+    }
+    let text = '';
+    if (!['INPUT','TEXTAREA','SELECT'].includes(el.tagName)) {
+      text = (el.innerText || el.textContent || '').trim().replace(/\s+/g,' ').slice(0,100);
+    }
+    const idx = interactive.length;
+    const line = '[' + idx + ']<' + tag + (parts.length ? ' ' + parts.join(' ') : '') + '>' + text + '</' + tag + '>';
+    if (total + line.length + 1 > MAX_CHARS) { truncated = true; break; }
+    total += line.length + 1;
+    interactive.push(el);
+    lines.push(line);
+  }
+  window.__donut_interactive = interactive;
+  return JSON.stringify({ elements: lines.join('\n'), count: interactive.length, truncated: truncated });
+})()"#;
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct McpRequest {
+  jsonrpc: String,
+  id: Option<serde_json::Value>,
+  method: String,
+  params: Option<serde_json::Value>,
+}
+
+const PROTOCOL_VERSION: &str = "2025-11-25";
+const SERVER_NAME: &str = "donut-browser";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Serialize)]
+pub struct McpResponse {
+  jsonrpc: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  id: Option<serde_json::Value>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  result: Option<serde_json::Value>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  error: Option<McpError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpError {
+  code: i32,
+  message: String,
+}
+
+/// Surface a CDP failure to the agent with the reason intact.
+///
+/// The distinction matters to whoever is on the other end: "the session is
+/// still provisioning" invites a retry in a few seconds, "you are signed out"
+/// does not, and flattening both into `-32000: something went wrong` is how an
+/// automation client ends up retrying a refusal forever.
+fn cdp_error(error: CdpError) -> McpError {
+  McpError {
+    code: -32000,
+    message: error.to_string(),
+  }
+}
+
+const DEFAULT_MCP_PORT: u16 = 51080;
+
+/// How long a keystroke waits for its acknowledgement before moving on.
+///
+/// Generous enough to absorb a relayed round trip, short enough that a browser
+/// which stops answering does not leave the caller typing into a socket that
+/// will never reply.
+const KEYSTROKE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct McpSession {
+  initialized: bool,
+}
+
+struct McpServerInner {
+  app_handle: Option<AppHandle>,
+  token: Option<String>,
+  shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+  sessions: HashMap<String, McpSession>,
+}
+
+#[derive(Clone)]
+struct McpHttpState {
+  server: &'static McpServer,
+  token: String,
+}
+
+pub struct McpServer {
+  inner: Arc<AsyncMutex<McpServerInner>>,
+  is_running: AtomicBool,
+  port: AtomicU16,
+}
+
+impl McpServer {
+  fn new() -> Self {
+    Self {
+      inner: Arc::new(AsyncMutex::new(McpServerInner {
+        app_handle: None,
+        token: None,
+        shutdown_tx: None,
+        sessions: HashMap::new(),
+      })),
+      is_running: AtomicBool::new(false),
+      port: AtomicU16::new(0),
+    }
+  }
+
+  pub fn instance() -> &'static McpServer {
+    &MCP_SERVER
+  }
+
+  pub fn is_running(&self) -> bool {
+    self.is_running.load(Ordering::SeqCst)
+  }
+
+  /// Gate an MCP tool on a capability the caller already resolved (e.g.
+  /// `CLOUD_AUTH.can_use_browser_automation().await`). Logs the rejected gate
+  /// with enough state for support to diagnose, without leaking secrets.
+  async fn require_capability(feature: &str, allowed: bool) -> Result<(), McpError> {
+    if !allowed {
+      let summary = match CLOUD_AUTH.get_user().await {
+        Some(state) => format!(
+          "logged_in=true plan={} status={} period={:?}",
+          state.user.plan, state.user.subscription_status, state.user.plan_period,
+        ),
+        None => "logged_in=false".to_string(),
+      };
+      log::warn!("[mcp] Rejected '{feature}' — plan does not include it ({summary})");
+      return Err(McpError {
+        code: -32000,
+        message: format!("{feature} requires a plan that includes this feature"),
+      });
+    }
+    Ok(())
+  }
+
+  pub fn get_port(&self) -> Option<u16> {
+    let port = self.port.load(Ordering::SeqCst);
+    if port > 0 {
+      Some(port)
+    } else {
+      None
+    }
+  }
+
+  pub async fn start(&self, app_handle: AppHandle) -> Result<u16, String> {
+    if !WayfernTermsManager::instance().is_terms_accepted() {
+      return Err(crate::backend_error("WAYFERN_TERMS_REQUIRED"));
+    }
+
+    if self.is_running() {
+      return Err(crate::backend_error("MCP_SERVER_ALREADY_RUNNING"));
+    }
+
+    let settings_manager = SettingsManager::instance();
+    let settings = settings_manager
+      .load_settings()
+      .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+
+    // Get or generate token
+    let existing_token = settings_manager
+      .get_mcp_token(&app_handle)
+      .await
+      .ok()
+      .flatten();
+
+    let token = if let Some(t) = existing_token {
+      t
+    } else {
+      settings_manager
+        .generate_mcp_token(&app_handle)
+        .await
+        .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
+    };
+
+    // Determine port (use saved port, or try default, or random)
+    let preferred_port = settings.mcp_port.unwrap_or(DEFAULT_MCP_PORT);
+    let listener = self.bind_to_available_port(preferred_port).await?;
+    let actual_port = listener
+      .local_addr()
+      .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
+      .port();
+
+    // Save port if it changed
+    if settings.mcp_port != Some(actual_port) {
+      let mut new_settings = settings;
+      new_settings.mcp_port = Some(actual_port);
+      settings_manager
+        .save_settings(&new_settings)
+        .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
+    }
+
+    // Store state
+    let mut inner = self.inner.lock().await;
+    inner.app_handle = Some(app_handle);
+    inner.token = Some(token.clone());
+
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    inner.shutdown_tx = Some(shutdown_tx);
+
+    self.port.store(actual_port, Ordering::SeqCst);
+    self.is_running.store(true, Ordering::SeqCst);
+
+    // Start HTTP server in background
+    let http_state = McpHttpState {
+      server: McpServer::instance(),
+      token,
+    };
+    tokio::spawn(Self::run_http_server(listener, http_state, shutdown_rx));
+
+    log::info!("[mcp] Server started on port {}", actual_port);
+    Ok(actual_port)
+  }
+
+  async fn bind_to_available_port(&self, preferred: u16) -> Result<TcpListener, String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], preferred));
+    if let Ok(listener) = TcpListener::bind(addr).await {
+      return Ok(listener);
+    }
+
+    for _ in 0..10 {
+      let port = 51000 + (rand::random::<u16>() % 1000);
+      let addr = SocketAddr::from(([127, 0, 0, 1], port));
+      if let Ok(listener) = TcpListener::bind(addr).await {
+        return Ok(listener);
+      }
+    }
+
+    Err(crate::backend_error("MCP_PORT_UNAVAILABLE"))
+  }
+
+  async fn run_http_server(
+    listener: TcpListener,
+    state: McpHttpState,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+  ) {
+    let app = Router::new()
+      .route(
+        "/mcp/{token}",
+        post(Self::handle_mcp_post)
+          .get(Self::handle_mcp_get)
+          .delete(Self::handle_mcp_delete),
+      )
+      .route(
+        "/mcp",
+        post(Self::handle_mcp_post)
+          .get(Self::handle_mcp_get)
+          .delete(Self::handle_mcp_delete),
+      )
+      .route("/health", get(Self::handle_health))
+      .layer(middleware::from_fn_with_state(
+        state.clone(),
+        Self::auth_middleware,
+      ))
+      .with_state(state);
+
+    let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+    let server = async move {
+      log::info!("[mcp] Server listening on http://127.0.0.1:{}/mcp", port);
+      if let Err(e) = axum::serve(listener, app).await {
+        log::error!("[mcp] Server error: {}", e);
+      }
+    };
+
+    tokio::select! {
+      _ = server => {},
+      _ = shutdown_rx => {
+        log::info!("[mcp] Server shutting down");
+      },
+    }
+  }
+
+  async fn auth_middleware(
+    State(state): State<McpHttpState>,
+    req: Request<Body>,
+    next: Next,
+  ) -> Result<Response, StatusCode> {
+    let path = req.uri().path();
+
+    if path == "/health" {
+      return Ok(next.run(req).await);
+    }
+
+    // Check token from URL path: /mcp/{token}
+    let path_token = path
+      .strip_prefix("/mcp/")
+      .filter(|t| !t.is_empty() && !t.contains('/'));
+
+    // Check token from Authorization header
+    let header_token = req
+      .headers()
+      .get(header::AUTHORIZATION)
+      .and_then(|h| h.to_str().ok())
+      .and_then(|h| h.strip_prefix("Bearer "));
+
+    // Constant-time comparison to avoid leaking the token prefix via timing.
+    use subtle::ConstantTimeEq;
+    let expected = state.token.as_bytes();
+    let ct_eq = |t: Option<&str>| {
+      t.is_some_and(|t| {
+        let b = t.as_bytes();
+        b.len() == expected.len() && b.ct_eq(expected).into()
+      })
+    };
+    let valid = ct_eq(path_token) || ct_eq(header_token);
+
+    if !valid {
+      return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
+  }
+
+  async fn handle_health() -> impl IntoResponse {
+    Json(serde_json::json!({
+      "status": "ok",
+      "server": SERVER_NAME,
+      "version": SERVER_VERSION,
+      "protocolVersion": PROTOCOL_VERSION,
+    }))
+  }
+
+  async fn handle_mcp_get() -> impl IntoResponse {
+    // We don't support server-initiated SSE streams
+    StatusCode::METHOD_NOT_ALLOWED
+  }
+
+  async fn handle_mcp_delete(
+    State(state): State<McpHttpState>,
+    req: Request<Body>,
+  ) -> impl IntoResponse {
+    let session_id = req
+      .headers()
+      .get("mcp-session-id")
+      .and_then(|h| h.to_str().ok())
+      .map(|s| s.to_string());
+
+    if let Some(sid) = session_id {
+      let mut inner = state.server.inner.lock().await;
+      inner.sessions.remove(&sid);
+      log::info!("[mcp] Session terminated: {}", sid);
+    }
+
+    StatusCode::OK
+  }
+
+  async fn handle_mcp_post(State(state): State<McpHttpState>, req: Request<Body>) -> Response {
+    let session_id = req
+      .headers()
+      .get("mcp-session-id")
+      .and_then(|h| h.to_str().ok())
+      .map(|s| s.to_string());
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+      Ok(b) => b,
+      Err(_) => {
+        return (StatusCode::BAD_REQUEST, "Invalid request body").into_response();
+      }
+    };
+
+    let request: McpRequest = match serde_json::from_slice(&body_bytes) {
+      Ok(r) => r,
+      Err(_) => {
+        return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
+      }
+    };
+
+    let is_notification = request.id.is_none();
+    let method = request.method.clone();
+
+    // Handle initialize (no session required)
+    if method == "initialize" {
+      let response = state.server.handle_initialize(request).await;
+      match response {
+        Ok((session_id, result)) => {
+          let body = McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(result.0),
+            result: Some(result.1),
+            error: None,
+          };
+          Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+        }
+        Err((id, error)) => {
+          let body = McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: None,
+            error: Some(error),
+          };
+          Json(body).into_response()
+        }
+      }
+    } else if is_notification {
+      // Notifications (like notifications/initialized) -> 202 Accepted
+      if method == "notifications/initialized" {
+        if let Some(sid) = &session_id {
+          let mut inner = state.server.inner.lock().await;
+          if let Some(session) = inner.sessions.get_mut(sid) {
+            session.initialized = true;
+          }
+        }
+      }
+      StatusCode::ACCEPTED.into_response()
+    } else {
+      // Validate session exists
+      if let Some(sid) = &session_id {
+        let inner = state.server.inner.lock().await;
+        if !inner.sessions.contains_key(sid) {
+          return StatusCode::NOT_FOUND.into_response();
+        }
+      }
+
+      if Self::is_automation_tool_call(&request) {
+        if let crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } =
+          crate::automation_rate_limiter::check_automation_rate_limit().await
+        {
+          log::warn!(
+            "[mcp] Rejected tools/call: automation rate limit exceeded; retry in {}s",
+            retry_after_secs
+          );
+          return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            "automation request rate limit exceeded",
+          )
+            .into_response();
+        }
+      }
+
+      let response = state.server.handle_request(request).await;
+      Json(response).into_response()
+    }
+  }
+
+  fn is_automation_tool_call(request: &McpRequest) -> bool {
+    if request.method != "tools/call" {
+      return false;
+    }
+
+    let Some(tool_name) = request
+      .params
+      .as_ref()
+      .and_then(|params| params.get("name"))
+      .and_then(|name| name.as_str())
+    else {
+      return false;
+    };
+
+    matches!(
+      tool_name,
+      "run_profile"
+        | "kill_profile"
+        | "batch_run_profiles"
+        | "batch_stop_profiles"
+        | "start_sync_session"
+        | "navigate"
+        | "screenshot"
+        | "evaluate_javascript"
+        | "click_element"
+        | "type_text"
+        | "get_page_content"
+        | "get_page_info"
+        | "get_interactive_elements"
+        | "click_by_index"
+        | "type_by_index"
+        // Starting a bot run leases a remote host for up to two hours and
+        // spends the account's pooled remote-hour budget, which makes it the
+        // most expensive tool here. Cancelling one reaches the same fleet, and
+        // is metered alongside the remote-session stop it mirrors.
+        //
+        // Deliberately absent: set_cookie_bot_schedule and
+        // delete_cookie_bot_schedule. They write one row in Donut cloud and
+        // lease nothing; metering them would throttle an agent enrolling a
+        // fleet of profiles, while the budget that actually guards the
+        // hardware is spent per RUN and enforced server-side.
+        | "run_cookie_bot_now"
+        | "cancel_cookie_bot_run"
+        // Leasing a remote host is the single most expensive action here, and
+        // ending one reaches the same fleet. Both are metered exactly as their
+        // REST equivalents already are.
+        | "run_profile_remote"
+        | "stop_remote_session"
+    )
+  }
+
+  pub async fn stop(&self) -> Result<(), String> {
+    if !self.is_running() {
+      return Err(crate::backend_error("MCP_SERVER_NOT_RUNNING"));
+    }
+
+    let mut inner = self.inner.lock().await;
+    inner.app_handle = None;
+    inner.token = None;
+    inner.sessions.clear();
+
+    // Send shutdown signal
+    if let Some(tx) = inner.shutdown_tx.take() {
+      let _ = tx.send(());
+    }
+
+    self.port.store(0, Ordering::SeqCst);
+    self.is_running.store(false, Ordering::SeqCst);
+
+    log::info!("[mcp] Server stopped");
+    Ok(())
+  }
+
+  pub fn get_tools(&self) -> Vec<McpTool> {
+    vec![
+      McpTool {
+        name: "list_profiles".to_string(),
+        description: "List all Wayfern browser profiles".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_profile".to_string(),
+        description: "Get details of a specific browser profile".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to retrieve"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "run_profile".to_string(),
+        description: "Launch a browser profile with an optional URL. Requires an active Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to launch"
+            },
+            "url": {
+              "type": "string",
+              "description": "Optional URL to open in the browser"
+            },
+            "headless": {
+              "type": "boolean",
+              "description": "Run the browser in headless mode"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "kill_profile".to_string(),
+        description: "Stop a running browser profile. Requires an active Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to stop"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "batch_run_profiles".to_string(),
+        description: "Launch multiple browser profiles at once with an optional URL. Requires an active Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "UUIDs of the profiles to launch"
+            },
+            "url": {
+              "type": "string",
+              "description": "Optional URL to open in every launched profile"
+            },
+            "headless": {
+              "type": "boolean",
+              "description": "Run the browsers in headless mode"
+            }
+          },
+          "required": ["profile_ids"]
+        }),
+      },
+      McpTool {
+        name: "batch_stop_profiles".to_string(),
+        description: "Stop multiple running browser profiles at once. Requires an active Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "UUIDs of the profiles to stop"
+            }
+          },
+          "required": ["profile_ids"]
+        }),
+      },
+      McpTool {
+        name: "create_profile".to_string(),
+        description: "Create a new browser profile".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Name for the new profile"
+            },
+            "browser": {
+              "type": "string",
+              "enum": ["wayfern"],
+              "description": "Browser engine to use"
+            },
+            "proxy_id": {
+              "type": "string",
+              "description": "Optional proxy UUID to assign"
+            },
+            "launch_hook": {
+              "type": "string",
+              "description": "Optional HTTP(S) URL to call before launch for transient proxy overrides"
+            },
+            "group_id": {
+              "type": "string",
+              "description": "Optional group UUID to assign"
+            },
+            "tags": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional tags for the profile"
+            }
+          },
+          "required": ["name", "browser"]
+        }),
+      },
+      McpTool {
+        name: "detect_browser_profiles".to_string(),
+        description: "Detect importable Chromium-family browser profiles (Chrome, Chromium, Brave) on this machine, or scan a custom folder for profile directories".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "folder": {
+              "type": "string",
+              "description": "Optional folder to scan instead of the default browser locations. Accepts a single profile dir, a Chromium user-data dir, or a folder holding one profile dir per child."
+            }
+          }
+        }),
+      },
+      McpTool {
+        name: "import_browser_profiles".to_string(),
+        description: "Bulk-import browser profiles from on-disk profile folders (e.g. paths returned by detect_browser_profiles). Each imported profile becomes a Wayfern profile; items are isolated so one failure doesn't stop the rest".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_path": {
+                    "type": "string",
+                    "description": "Path to the source profile directory"
+                  },
+                  "new_profile_name": {
+                    "type": "string",
+                    "description": "Name for the imported profile"
+                  },
+                  "proxy_id": {
+                    "type": "string",
+                    "description": "Optional proxy UUID to assign to this profile"
+                  },
+                  "vpn_id": {
+                    "type": "string",
+                    "description": "Optional VPN UUID to assign to this profile"
+                  },
+                  "browser_type": {
+                    "type": "string",
+                    "description": "Source browser family (chromium, brave, edge, vivaldi, opera, arc, yandex, ...). Selects which OS keychain entry holds the key that unlocks the source's cookies and passwords, so an accurate value is what makes secrets survive the import"
+                  },
+                  "allow_running": {
+                    "type": "boolean",
+                    "description": "Import even though the source browser is running. Databases are still snapshotted consistently, but site data stored in LevelDB may be captured mid-write"
+                  }
+                },
+                "required": ["source_path", "new_profile_name"]
+              },
+              "description": "Profiles to import"
+            },
+            "group_id": {
+              "type": "string",
+              "description": "Optional group UUID assigned to every imported profile"
+            },
+            "duplicate_strategy": {
+              "type": "string",
+              "enum": ["skip", "rename"],
+              "description": "How to handle an already-taken profile name (default: rename with a numeric suffix)"
+            }
+          },
+          "required": ["items"]
+        }),
+      },
+      McpTool {
+        name: "update_profile".to_string(),
+        description: "Update an existing browser profile's settings".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to update"
+            },
+            "name": {
+              "type": "string",
+              "description": "New name for the profile"
+            },
+            "proxy_id": {
+              "type": "string",
+              "description": "Proxy UUID to assign (empty string to remove)"
+            },
+            "launch_hook": {
+              "type": "string",
+              "description": "Launch hook URL to assign (empty string to remove)"
+            },
+            "group_id": {
+              "type": "string",
+              "description": "Group UUID to assign (empty string to remove)"
+            },
+            "tags": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Tags for the profile (replaces existing tags)"
+            },
+            "extension_group_id": {
+              "type": "string",
+              "description": "Extension group UUID to assign (empty string to remove)"
+            },
+            "proxy_bypass_rules": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Proxy bypass rules (replaces existing rules)"
+            },
+            "clear_on_close": {
+              "type": "boolean",
+              "description": "Wipe browsing data (keeping extensions and bookmarks) when the browser exits. Not available for ephemeral or password-protected profiles."
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "delete_profile".to_string(),
+        description: "Delete a browser profile and all its data".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to delete"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "list_tags".to_string(),
+        description: "List all tags used across profiles".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "list_proxies".to_string(),
+        description: "List all configured proxies".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_profile_status".to_string(),
+        description: "Check whether a browser profile is running and can be driven. Returns is_running (true when the browser can be driven, wherever it is), location ('local', 'remote' or 'stopped'), is_running_locally, and remote_session_id when it is running on the remote fleet.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to check"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      // Group management tools
+      McpTool {
+        name: "list_groups".to_string(),
+        description: "List all profile groups".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_group".to_string(),
+        description: "Get details of a specific group".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The UUID of the group to retrieve"
+            }
+          },
+          "required": ["group_id"]
+        }),
+      },
+      McpTool {
+        name: "create_group".to_string(),
+        description: "Create a new profile group".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "The name for the new group"
+            }
+          },
+          "required": ["name"]
+        }),
+      },
+      McpTool {
+        name: "update_group".to_string(),
+        description: "Update an existing group's name".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The UUID of the group to update"
+            },
+            "name": {
+              "type": "string",
+              "description": "The new name for the group"
+            }
+          },
+          "required": ["group_id", "name"]
+        }),
+      },
+      McpTool {
+        name: "delete_group".to_string(),
+        description: "Delete a profile group".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The UUID of the group to delete"
+            }
+          },
+          "required": ["group_id"]
+        }),
+      },
+      McpTool {
+        name: "assign_profiles_to_group".to_string(),
+        description: "Assign one or more profiles to a group".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Array of profile UUIDs to assign"
+            },
+            "group_id": {
+              "type": "string",
+              "description": "The UUID of the group to assign to (null to remove from group)"
+            }
+          },
+          "required": ["profile_ids"]
+        }),
+      },
+      // Full proxy management tools
+      McpTool {
+        name: "get_proxy".to_string(),
+        description: "Get details of a specific proxy".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "proxy_id": {
+              "type": "string",
+              "description": "The UUID of the proxy to retrieve"
+            }
+          },
+          "required": ["proxy_id"]
+        }),
+      },
+      McpTool {
+        name: "create_proxy".to_string(),
+        description: "Create a new proxy configuration.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "The name for the new proxy"
+            },
+            "proxy_type": {
+              "type": "string",
+              "enum": ["http", "https", "socks4", "socks5", "vless"],
+              "description": "The proxy protocol"
+            },
+            "host": {
+              "type": "string",
+              "description": "The proxy host address (for regular proxies)"
+            },
+            "port": {
+              "type": "integer",
+              "description": "The proxy port number (for regular proxies)"
+            },
+            "username": {
+              "type": "string",
+              "description": "Optional username for authentication (for regular proxies)"
+            },
+            "password": {
+              "type": "string",
+              "description": "Optional password for authentication (for regular proxies)"
+            },
+            "vless_uri": {
+              "type": "string",
+              "description": "VLESS + XTLS Vision + REALITY share URI"
+            }
+          },
+          "required": ["name", "proxy_type"]
+        }),
+      },
+      McpTool {
+        name: "update_proxy".to_string(),
+        description: "Update an existing proxy configuration".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "proxy_id": {
+              "type": "string",
+              "description": "The UUID of the proxy to update"
+            },
+            "name": {
+              "type": "string",
+              "description": "New name for the proxy"
+            },
+            "proxy_type": {
+              "type": "string",
+              "enum": ["http", "https", "socks4", "socks5", "vless"],
+              "description": "The proxy protocol"
+            },
+            "host": {
+              "type": "string",
+              "description": "The proxy host address (for regular proxies)"
+            },
+            "port": {
+              "type": "integer",
+              "description": "The proxy port number (for regular proxies)"
+            },
+            "username": {
+              "type": "string",
+              "description": "Optional username for authentication (for regular proxies)"
+            },
+            "password": {
+              "type": "string",
+              "description": "Optional password for authentication (for regular proxies)"
+            },
+            "vless_uri": {
+              "type": "string",
+              "description": "VLESS + XTLS Vision + REALITY share URI"
+            }
+          },
+          "required": ["proxy_id"]
+        }),
+      },
+      McpTool {
+        name: "delete_proxy".to_string(),
+        description: "Delete a proxy configuration".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "proxy_id": {
+              "type": "string",
+              "description": "The UUID of the proxy to delete"
+            }
+          },
+          "required": ["proxy_id"]
+        }),
+      },
+      McpTool {
+        name: "export_proxies".to_string(),
+        description: "Export all proxy configurations".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string",
+              "enum": ["json", "txt"],
+              "description": "Export format (json for structured data, txt for URL format)"
+            }
+          },
+          "required": ["format"]
+        }),
+      },
+      McpTool {
+        name: "import_proxies".to_string(),
+        description: "Import proxy configurations from JSON or TXT content".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The proxy configuration content to import"
+            },
+            "format": {
+              "type": "string",
+              "enum": ["json", "txt"],
+              "description": "Import format (json or txt)"
+            },
+            "name_prefix": {
+              "type": "string",
+              "description": "Optional prefix for imported proxy names (default: 'Imported')"
+            }
+          },
+          "required": ["content", "format"]
+        }),
+      },
+      // VPN management tools
+      McpTool {
+        name: "import_vpn".to_string(),
+        description: "Import a WireGuard (.conf) configuration".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "Raw WireGuard config file content"
+            },
+            "filename": {
+              "type": "string",
+              "description": "Original filename (.conf)"
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional display name for the VPN config"
+            }
+          },
+          "required": ["content", "filename"]
+        }),
+      },
+      McpTool {
+        name: "list_vpn_configs".to_string(),
+        description: "List all stored VPN configurations".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "delete_vpn".to_string(),
+        description: "Delete a VPN configuration".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "vpn_id": {
+              "type": "string",
+              "description": "The UUID of the VPN config to delete"
+            }
+          },
+          "required": ["vpn_id"]
+        }),
+      },
+      McpTool {
+        name: "connect_vpn".to_string(),
+        description: "Connect to a VPN configuration".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "vpn_id": {
+              "type": "string",
+              "description": "The UUID of the VPN config to connect"
+            }
+          },
+          "required": ["vpn_id"]
+        }),
+      },
+      McpTool {
+        name: "disconnect_vpn".to_string(),
+        description: "Disconnect from a VPN".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "vpn_id": {
+              "type": "string",
+              "description": "The UUID of the VPN to disconnect"
+            }
+          },
+          "required": ["vpn_id"]
+        }),
+      },
+      McpTool {
+        name: "get_vpn_status".to_string(),
+        description: "Get the connection status of a VPN".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "vpn_id": {
+              "type": "string",
+              "description": "The UUID of the VPN to check"
+            }
+          },
+          "required": ["vpn_id"]
+        }),
+      },
+      // Fingerprint management tools
+      McpTool {
+        name: "get_profile_fingerprint".to_string(),
+        description: "Get the fingerprint configuration for a Wayfern profile"
+          .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "update_profile_fingerprint".to_string(),
+        description:
+          "Update the fingerprint configuration for a Wayfern profile. Requires an active Pro subscription."
+            .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to update"
+            },
+            "fingerprint": {
+              "type": "string",
+              "description": "JSON string of the fingerprint configuration, or null to clear"
+            },
+            "os": {
+              "type": "string",
+              "enum": ["windows", "macos", "linux"],
+              "description": "Operating system for fingerprint generation"
+            },
+            "randomize_fingerprint_on_launch": {
+              "type": "boolean",
+              "description": "Whether to generate a new fingerprint on every launch"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "update_profile_proxy_bypass_rules".to_string(),
+        description:
+          "Update proxy bypass rules for a profile. Requests matching these rules will connect directly, bypassing the proxy."
+            .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to update"
+            },
+            "rules": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Array of bypass rules. Supports hostnames (e.g. 'example.com'), IP addresses, and regex patterns."
+            }
+          },
+          "required": ["profile_id", "rules"]
+        }),
+      },
+      McpTool {
+        name: "update_profile_dns_blocklist".to_string(),
+        description:
+          "Update the DNS blocklist level for a profile. Blocks ads, trackers, and malware domains at the proxy level."
+            .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to update"
+            },
+            "level": {
+              "type": "string",
+              "enum": ["none", "light", "normal", "pro", "pro_plus", "ultimate"],
+              "description": "DNS blocklist level. 'none' disables blocking."
+            }
+          },
+          "required": ["profile_id", "level"]
+        }),
+      },
+      McpTool {
+        name: "get_dns_blocklist_status".to_string(),
+        description: "Get the cache status of all DNS blocklist tiers including entry counts and freshness.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "list_extensions".to_string(),
+        description: "List all managed browser extensions. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "list_extension_groups".to_string(),
+        description: "List all extension groups. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "add_extension".to_string(),
+        description: "Add a managed browser extension from a path on the machine running Donut: a .crx or .zip archive file, or an unpacked extension folder holding a top-level manifest.json. With link set to true, which only applies to a folder, the folder is loaded in place instead of being copied into Donut, so edits to it apply on the next browser start and the extension is machine-local and never synced. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "Path on the machine running Donut to a .crx/.zip file or to an unpacked extension folder" },
+            "name": { "type": "string", "description": "Display name, used only when the manifest carries no name of its own" },
+            "link": { "type": "boolean", "description": "Folders only: load the folder in place instead of copying it into Donut. Linked extensions never sync. Defaults to false." }
+          },
+          "required": ["path"]
+        }),
+      },
+      McpTool {
+        name: "update_extension".to_string(),
+        description: "Rename a managed extension and/or replace its payload from a path on the machine running Donut: a .crx or .zip archive file, or an unpacked extension folder holding a top-level manifest.json. With link set to true, which only applies to a folder, the folder is loaded in place instead of being copied into Donut, so the extension becomes machine-local and never syncs. At least one of name or path must be given. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "extension_id": { "type": "string", "description": "The extension ID to update" },
+            "name": { "type": "string", "description": "New display name" },
+            "path": { "type": "string", "description": "Path on the machine running Donut to the .crx/.zip file or unpacked extension folder to replace the payload with" },
+            "link": { "type": "boolean", "description": "Folders only: load the folder in place instead of copying it into Donut. Linked extensions never sync. Defaults to false." }
+          },
+          "required": ["extension_id"]
+        }),
+      },
+      McpTool {
+        name: "create_extension_group".to_string(),
+        description: "Create a new extension group. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "Name for the extension group" }
+          },
+          "required": ["name"]
+        }),
+      },
+      McpTool {
+        name: "update_extension_group".to_string(),
+        description: "Rename an extension group and/or replace its membership with an exact list of extension IDs. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": { "type": "string", "description": "The extension group ID to update" },
+            "name": { "type": "string", "description": "New name for the extension group" },
+            "extension_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "The complete set of extension IDs the group should contain, replacing the current membership"
+            }
+          },
+          "required": ["group_id"]
+        }),
+      },
+      McpTool {
+        name: "add_extension_to_group".to_string(),
+        description: "Add an extension to an extension group. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": { "type": "string", "description": "The extension group ID" },
+            "extension_id": { "type": "string", "description": "The extension ID to add to the group" }
+          },
+          "required": ["group_id", "extension_id"]
+        }),
+      },
+      McpTool {
+        name: "remove_extension_from_group".to_string(),
+        description: "Remove an extension from an extension group. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": { "type": "string", "description": "The extension group ID" },
+            "extension_id": { "type": "string", "description": "The extension ID to remove from the group" }
+          },
+          "required": ["group_id", "extension_id"]
+        }),
+      },
+      McpTool {
+        name: "delete_extension".to_string(),
+        description: "Delete a managed extension. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "extension_id": { "type": "string", "description": "The extension ID to delete" }
+          },
+          "required": ["extension_id"]
+        }),
+      },
+      McpTool {
+        name: "delete_extension_group".to_string(),
+        description: "Delete an extension group. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "group_id": { "type": "string", "description": "The extension group ID to delete" }
+          },
+          "required": ["group_id"]
+        }),
+      },
+      McpTool {
+        name: "assign_extension_group_to_profile".to_string(),
+        description: "Assign an extension group to a profile, or remove the assignment. Requires Pro subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The profile ID" },
+            "extension_group_id": { "type": "string", "description": "The extension group ID, or empty string to remove" }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      // Cookie management tools
+      McpTool {
+        name: "import_profile_cookies".to_string(),
+        description: "Import cookies into a Wayfern profile from a JSON array (Puppeteer / EditThisCookie format) or a Netscape cookies.txt. Format is auto-detected. The browser must not be running.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the target profile"
+            },
+            "content": {
+              "type": "string",
+              "description": "Raw cookie file content (JSON array or Netscape cookies.txt)"
+            }
+          },
+          "required": ["profile_id", "content"]
+        }),
+      },
+      // Team lock tools
+      McpTool {
+        name: "get_team_locks".to_string(),
+        description: "List all active team profile locks. Requires team plan.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_team_lock_status".to_string(),
+        description: "Check if a profile is locked by a team member. Requires team plan.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to check"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      // Synchronizer tools
+      McpTool {
+        name: "start_sync_session".to_string(),
+        description: "Start a synchronizer session. Launches a leader profile and follower profiles, then mirrors all actions from the leader to the followers in real time. Only Wayfern profiles are supported. Requires paid subscription.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "leader_profile_id": {
+              "type": "string",
+              "description": "The UUID of the leader profile"
+            },
+            "follower_profile_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "UUIDs of follower profiles"
+            }
+          },
+          "required": ["leader_profile_id", "follower_profile_ids"]
+        }),
+      },
+      McpTool {
+        name: "stop_sync_session".to_string(),
+        description: "Stop an active synchronizer session. Kills all follower profiles and the leader.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "The sync session ID"
+            }
+          },
+          "required": ["session_id"]
+        }),
+      },
+      McpTool {
+        name: "get_sync_sessions".to_string(),
+        description: "List all active synchronizer sessions.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {}
+        }),
+      },
+      McpTool {
+        name: "remove_sync_follower".to_string(),
+        description: "Remove a follower from an active synchronizer session.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "The sync session ID"
+            },
+            "follower_profile_id": {
+              "type": "string",
+              "description": "The UUID of the follower to remove"
+            }
+          },
+          "required": ["session_id", "follower_profile_id"]
+        }),
+      },
+      // Browser interaction tools
+      McpTool {
+        name: "navigate".to_string(),
+        description: "Navigate a running browser profile to a URL. Waits for the page to fully load before returning.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "url": {
+              "type": "string",
+              "description": "The URL to navigate to"
+            }
+          },
+          "required": ["profile_id", "url"]
+        }),
+      },
+      McpTool {
+        name: "screenshot".to_string(),
+        description: "Take a screenshot of the current page in a running browser profile. Returns base64-encoded image."
+          .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "format": {
+              "type": "string",
+              "enum": ["png", "jpeg", "webp"],
+              "description": "Image format (default: png)"
+            },
+            "quality": {
+              "type": "integer",
+              "description": "Image quality 0-100 for jpeg/webp (default: 80)"
+            },
+            "full_page": {
+              "type": "boolean",
+              "description": "Capture the full scrollable page (default: false)"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "evaluate_javascript".to_string(),
+        description:
+          "Execute JavaScript in the context of the current page and return the result. Works with both static and dynamically-generated content. Set wait_for_load=true if the script triggers navigation (e.g., form.submit())."
+            .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "expression": {
+              "type": "string",
+              "description": "JavaScript expression to evaluate"
+            },
+            "await_promise": {
+              "type": "boolean",
+              "description": "Whether to await the result if it's a Promise (default: false)"
+            },
+            "wait_for_load": {
+              "type": "boolean",
+              "description": "Wait for page load after execution, use when the script triggers navigation like form.submit() (default: false)"
+            }
+          },
+          "required": ["profile_id", "expression"]
+        }),
+      },
+      McpTool {
+        name: "click_element".to_string(),
+        description: "Click on an element identified by a CSS selector. If the click triggers a page navigation, waits for the new page to load before returning.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "selector": {
+              "type": "string",
+              "description": "CSS selector for the element to click"
+            }
+          },
+          "required": ["profile_id", "selector"]
+        }),
+      },
+      McpTool {
+        name: "type_text".to_string(),
+        description: "Focus an element by CSS selector and type text into it. By default uses realistic human-like typing with variable speed, natural errors, and self-corrections. Only set instant=true when you are certain the target does not have bot detection (e.g. browser address bars, developer tools, internal apps) — using instant on public websites risks the profile being flagged as a bot.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "selector": {
+              "type": "string",
+              "description": "CSS selector for the input element"
+            },
+            "text": {
+              "type": "string",
+              "description": "Text to type into the element"
+            },
+            "clear_first": {
+              "type": "boolean",
+              "description": "Clear the input before typing (default: true)"
+            },
+            "instant": {
+              "type": "boolean",
+              "description": "Paste all text at once instead of human typing. WARNING: only use on targets without bot detection — using this on public websites risks the profile being flagged."
+            },
+            "wpm": {
+              "type": "number",
+              "description": "Target words per minute for human typing (default: 80)"
+            }
+          },
+          "required": ["profile_id", "selector", "text"]
+        }),
+      },
+      McpTool {
+        name: "get_page_content".to_string(),
+        description:
+          "Get the content of the current page. Works with both static HTML and JavaScript-rendered content."
+            .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "format": {
+              "type": "string",
+              "enum": ["html", "text"],
+              "description": "Content format: 'html' for full HTML, 'text' for visible text only (default: text)"
+            },
+            "selector": {
+              "type": "string",
+              "description": "Optional CSS selector to get content of a specific element instead of the whole page"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "get_page_info".to_string(),
+        description: "Get metadata about the current page including URL, title, and readiness state"
+          .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "get_interactive_elements".to_string(),
+        description: "Enumerate visible interactive elements on the page (buttons, links, inputs, etc.) as a compact indexed list. The returned indices are stable for the current page and can be used with click_by_index and type_by_index instead of guessing CSS selectors. Call this before click_by_index / type_by_index, and re-call after any navigation or major DOM change. Far cheaper in tokens than get_page_content for agentic browsing.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "Cap on the serialized output length (default: 40000). The response carries a `truncated` flag if the list was cut off — narrow the viewport or scroll if you need elements past the cutoff."
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "click_by_index".to_string(),
+        description: "Click the element at the given index from the last get_interactive_elements call. Indices are valid until the next navigation. If the click triggers navigation, waits for the new page to load before returning.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "index": {
+              "type": "integer",
+              "description": "Zero-based index from the last get_interactive_elements response"
+            }
+          },
+          "required": ["profile_id", "index"]
+        }),
+      },
+      McpTool {
+        name: "type_by_index".to_string(),
+        description: "Focus the element at the given index from the last get_interactive_elements call and type text into it. Same human-like-typing defaults as type_text; only set instant=true when you're sure the target lacks bot detection.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "index": {
+              "type": "integer",
+              "description": "Zero-based index from the last get_interactive_elements response"
+            },
+            "text": {
+              "type": "string",
+              "description": "Text to type into the element"
+            },
+            "clear_first": {
+              "type": "boolean",
+              "description": "Clear the input before typing (default: true)"
+            },
+            "instant": {
+              "type": "boolean",
+              "description": "Paste all text at once instead of human typing. WARNING: only use on targets without bot detection."
+            },
+            "wpm": {
+              "type": "number",
+              "description": "Target words per minute for human typing (default: 80)"
+            }
+          },
+          "required": ["profile_id", "index", "text"]
+        }),
+      },
+      // Remote fleet. An agent that could drive a remote profile but not start
+      // one had to be handed a session by something else — the REST API or the
+      // GUI — which is no use to an MCP client running on its own.
+      McpTool {
+        name: "run_profile_remote".to_string(),
+        description: "Start this profile on a remote host of its own operating system. The profile must have Regular cloud sync enabled. Returns a session id; poll get_remote_session until state is 'live', then drive it with navigate, screenshot, click_element and the rest exactly as you would a local profile.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to run remotely"
+            },
+            "url": {
+              "type": "string",
+              "description": "Optional URL to open once the browser is up"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "stop_remote_session".to_string(),
+        description: "Stop a remote session and settle what it cost. A session left running bills until the fleet's two-hour cap, so stop one as soon as you are done with it".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "Session id returned by run_profile_remote"
+            }
+          },
+          "required": ["session_id"]
+        }),
+      },
+      // Observability. `run_profile_remote` hands back a session id and the
+      // word "provisioning"; without these an agent can only learn that a
+      // session became usable by trying to drive it and failing.
+      McpTool {
+        name: "list_remote_sessions".to_string(),
+        description: "List the remote browser sessions this account currently owns, with their live status".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_remote_session".to_string(),
+        description: "Read one remote session's real state: provisioning, ready, live or closed, plus whether it can be driven yet".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "Session id returned when the remote session was started"
+            }
+          },
+          "required": ["session_id"]
+        }),
+      },
+      McpTool {
+        name: "get_remote_hours_quota".to_string(),
+        description: "Read the pooled remote-hour budget. Bot runs and interactive remote sessions spend the same pool".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      // Cookie bot. Every one of these is a proxy onto Donut cloud, which owns
+      // the schedule and the browsing behaviour; the tools carry only the
+      // user's own choices.
+      McpTool {
+        name: "list_cookie_bot_schedules".to_string(),
+        description: "List profiles enrolled in the nightly cookie bot".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "enum": ["mine", "team"],
+              "description": "Whose enrolments to list (default: mine)"
+            }
+          },
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_cookie_bot_schedule".to_string(),
+        description: "Get one profile's cookie-bot enrolment, or null when it is not enrolled".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "set_cookie_bot_schedule".to_string(),
+        description: "Enrol a profile in the nightly cookie bot, or replace its enrolment. The profile must have cloud sync (not end-to-end encrypted), a recorded Windows or macOS operating system, and a proxy or VPN".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to enrol"
+            },
+            "profile_name": {
+              "type": "string",
+              "description": "Label shown in run history (default: the profile's own name)"
+            },
+            "platform": {
+              "type": "string",
+              "enum": ["windows", "macos"],
+              "description": "Must match the profile's own operating system; taken from the profile when omitted"
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the nightly run is armed"
+            },
+            "run_at_minute": {
+              "type": "integer",
+              "description": "Minutes past local midnight, 0-1439"
+            },
+            "days_mask": {
+              "type": "integer",
+              "description": "Bitmask of local weekdays, bit 0 = Monday, 1-127"
+            },
+            "timezone": {
+              "type": "string",
+              "description": "IANA zone the run time is expressed in, e.g. Europe/Berlin"
+            },
+            "preset": {
+              "type": "string",
+              "description": "Preset id from list_cookie_bot_presets"
+            },
+            "max_minutes": {
+              "type": "integer",
+              "description": "Upper bound on one run, in minutes"
+            },
+            "sites": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Absolute http(s) URLs to browse. The bot visits only these"
+            },
+            "jitter_seconds": {
+              "type": "integer",
+              "description": "Random spread around the run time, in seconds"
+            },
+            "acknowledge_conflict": {
+              "type": "boolean",
+              "description": "Write anyway when a teammate already enrols this profile"
+            }
+          },
+          "required": ["profile_id", "enabled", "run_at_minute", "days_mask", "timezone", "preset", "max_minutes"]
+        }),
+      },
+      McpTool {
+        name: "delete_cookie_bot_schedule".to_string(),
+        description: "Turn the cookie bot off for a profile. Safe to repeat; a run already in flight is not cancelled".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to unenrol"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "check_cookie_bot_conflicts".to_string(),
+        description: "Ask, without writing anything, which teammates already enrol this profile and whether a proposed time would overlap theirs".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            },
+            "run_at_minute": {
+              "type": "integer",
+              "description": "Proposed minutes past local midnight, 0-1439"
+            },
+            "timezone": {
+              "type": "string",
+              "description": "Proposed IANA zone"
+            },
+            "days_mask": {
+              "type": "integer",
+              "description": "Proposed weekday bitmask, bit 0 = Monday"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "list_cookie_bot_runs".to_string(),
+        description: "List cookie-bot runs, newest first, with how many sites each visited and what it cost".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "Restrict to one profile"
+            },
+            "scope": {
+              "type": "string",
+              "enum": ["mine", "team"],
+              "description": "Whose runs to list (default: mine)"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Page size, 1-100 (default: 30)"
+            },
+            "before": {
+              "type": "string",
+              "description": "Keyset cursor from a previous page's next_before"
+            }
+          },
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "run_cookie_bot_now".to_string(),
+        description: "Start a cookie-bot run immediately instead of waiting for the schedule. The profile must already be enrolled: the preset and site list live in its schedule. Requires an active Pro subscription and spends the pooled remote-hour budget".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the enrolled profile to warm"
+            },
+            "max_minutes": {
+              "type": "integer",
+              "description": "Cap this run only, overriding the schedule's own"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "cancel_cookie_bot_run".to_string(),
+        description: "Stop a cookie-bot run that is still going. Idempotent: cancelling a finished run returns it unchanged".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "description": "Run id from list_cookie_bot_runs"
+            }
+          },
+          "required": ["run_id"]
+        }),
+      },
+      McpTool {
+        name: "list_cookie_bot_presets".to_string(),
+        description: "List the cookie-bot intensities that can be chosen, with roughly how long each takes".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "get_cookie_bot_usage".to_string(),
+        description: "Per-member and per-profile cookie-bot spend for a calendar month. Reporting only".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "string",
+              "description": "Calendar month as YYYY-MM (default: the current UTC month)"
+            }
+          },
+          "required": []
+        }),
+      },
+    ]
+  }
+
+  async fn handle_initialize(
+    &self,
+    request: McpRequest,
+  ) -> Result<(String, (serde_json::Value, serde_json::Value)), (serde_json::Value, McpError)> {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+
+    if !self.is_running() {
+      return Err((
+        id,
+        McpError {
+          code: -32001,
+          message: "MCP server is not running".to_string(),
+        },
+      ));
+    }
+
+    // Create session
+    let session_id = Uuid::new_v4().to_string();
+    {
+      let mut inner = self.inner.lock().await;
+      inner
+        .sessions
+        .insert(session_id.clone(), McpSession { initialized: false });
+    }
+
+    let result = serde_json::json!({
+      "protocolVersion": PROTOCOL_VERSION,
+      "capabilities": {
+        "tools": {
+          "listChanged": false
+        }
+      },
+      "serverInfo": {
+        "name": SERVER_NAME,
+        "version": SERVER_VERSION,
+      },
+      "instructions": "Donut Browser MCP server. Use tools/list to discover available browser automation tools."
+    });
+
+    log::info!("[mcp] New session initialized: {}", session_id);
+    Ok((session_id, (id, result)))
+  }
+
+  pub async fn handle_request(&self, request: McpRequest) -> McpResponse {
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+
+    if !self.is_running() {
+      return McpResponse {
+        jsonrpc: "2.0".to_string(),
+        id: Some(id),
+        result: None,
+        error: Some(McpError {
+          code: -32001,
+          message: "MCP server is not running".to_string(),
+        }),
+      };
+    }
+
+    let result = match request.method.as_str() {
+      "ping" => Ok(serde_json::json!({})),
+      "tools/list" => self.handle_tools_list().await,
+      "tools/call" => self.handle_tool_call(request.params).await,
+      _ => Err(McpError {
+        code: -32601,
+        message: format!("Method not found: {}", request.method),
+      }),
+    };
+
+    match result {
+      Ok(value) => McpResponse {
+        jsonrpc: "2.0".to_string(),
+        id: Some(id),
+        result: Some(value),
+        error: None,
+      },
+      Err(error) => McpResponse {
+        jsonrpc: "2.0".to_string(),
+        id: Some(id),
+        result: None,
+        error: Some(error),
+      },
+    }
+  }
+
+  async fn handle_tools_list(&self) -> Result<serde_json::Value, McpError> {
+    Ok(serde_json::json!({
+      "tools": self.get_tools()
+    }))
+  }
+
+  async fn handle_tool_call(
+    &self,
+    params: Option<serde_json::Value>,
+  ) -> Result<serde_json::Value, McpError> {
+    let params = params.ok_or_else(|| McpError {
+      code: -32602,
+      message: "Missing parameters".to_string(),
+    })?;
+
+    let tool_name = params
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing tool name".to_string(),
+      })?;
+
+    let arguments = params
+      .get("arguments")
+      .cloned()
+      .unwrap_or(serde_json::json!({}));
+
+    // Surface the call in logs so customer reports show which tools the MCP
+    // client is actually invoking (and therefore which gate any subsequent
+    // error came from). Log only the tool name and the profile_id arg —
+    // arbitrary URLs / JS / selectors can be sensitive.
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .unwrap_or("<none>");
+    log::info!("[mcp] tools/call name={tool_name} profile_id={profile_id}");
+
+    let started = std::time::Instant::now();
+    let result = self.dispatch_tool_call(tool_name, &arguments).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match &result {
+      Ok(_) => {
+        log::info!(
+          "[mcp] tools/call name={tool_name} profile_id={profile_id} -> ok ({elapsed_ms} ms)"
+        );
+      }
+      Err(e) => {
+        log::warn!(
+          "[mcp] tools/call name={tool_name} profile_id={profile_id} -> error code={} msg={:?} ({elapsed_ms} ms)",
+          e.code,
+          e.message
+        );
+      }
+    }
+    result
+  }
+
+  async fn dispatch_tool_call(
+    &self,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    match tool_name {
+      "list_profiles" => self.handle_list_profiles().await,
+      "get_profile" => self.handle_get_profile(arguments).await,
+      "run_profile" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_run_profile(arguments).await
+      }
+      "kill_profile" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_kill_profile(arguments).await
+      }
+      "batch_run_profiles" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_batch_run_profiles(arguments).await
+      }
+      "batch_stop_profiles" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_batch_stop_profiles(arguments).await
+      }
+      "create_profile" => self.handle_create_profile(arguments).await,
+      // Profile import (free, like create_profile — importing is not automation)
+      "detect_browser_profiles" => self.handle_detect_browser_profiles(arguments).await,
+      "import_browser_profiles" => self.handle_import_browser_profiles(arguments).await,
+      "update_profile" => self.handle_update_profile(arguments).await,
+      "delete_profile" => self.handle_delete_profile(arguments).await,
+      "list_tags" => self.handle_list_tags().await,
+      "list_proxies" => self.handle_list_proxies().await,
+      "get_profile_status" => self.handle_get_profile_status(arguments).await,
+      // Group management
+      "list_groups" => self.handle_list_groups().await,
+      "get_group" => self.handle_get_group(arguments).await,
+      "create_group" => self.handle_create_group(arguments).await,
+      "update_group" => self.handle_update_group(arguments).await,
+      "delete_group" => self.handle_delete_group(arguments).await,
+      "assign_profiles_to_group" => self.handle_assign_profiles_to_group(arguments).await,
+      // Full proxy management
+      "get_proxy" => self.handle_get_proxy(arguments).await,
+      "create_proxy" => self.handle_create_proxy(arguments).await,
+      "update_proxy" => self.handle_update_proxy(arguments).await,
+      "delete_proxy" => self.handle_delete_proxy(arguments).await,
+      // Proxy import/export
+      "export_proxies" => self.handle_export_proxies(arguments).await,
+      "import_proxies" => self.handle_import_proxies(arguments).await,
+      // VPN management
+      "import_vpn" => self.handle_import_vpn(arguments).await,
+      "list_vpn_configs" => self.handle_list_vpn_configs().await,
+      "delete_vpn" => self.handle_delete_vpn(arguments).await,
+      "connect_vpn" => self.handle_connect_vpn(arguments).await,
+      "disconnect_vpn" => self.handle_disconnect_vpn(arguments).await,
+      "get_vpn_status" => self.handle_get_vpn_status(arguments).await,
+      // Fingerprint management — viewing is free everywhere (matches the REST
+      // API and the get_profile tool, which already expose the config); only
+      // editing requires a paid plan.
+      "get_profile_fingerprint" => self.handle_get_profile_fingerprint(arguments).await,
+      "update_profile_fingerprint" => {
+        Self::require_capability(
+          "Fingerprint editing",
+          CLOUD_AUTH.can_use_cross_os_fingerprints().await,
+        )
+        .await?;
+        self.handle_update_profile_fingerprint(arguments).await
+      }
+      "update_profile_proxy_bypass_rules" => {
+        self
+          .handle_update_profile_proxy_bypass_rules(arguments)
+          .await
+      }
+      // DNS blocklist management
+      "update_profile_dns_blocklist" => self.handle_update_profile_dns_blocklist(arguments).await,
+      "get_dns_blocklist_status" => self.handle_get_dns_blocklist_status().await,
+      // Extension management
+      "list_extensions" => self.handle_list_extensions().await,
+      "list_extension_groups" => self.handle_list_extension_groups().await,
+      "add_extension" => self.handle_add_extension(arguments).await,
+      "update_extension" => self.handle_update_extension(arguments).await,
+      "create_extension_group" => self.handle_create_extension_group(arguments).await,
+      "update_extension_group" => self.handle_update_extension_group(arguments).await,
+      "add_extension_to_group" => self.handle_add_extension_to_group(arguments).await,
+      "remove_extension_from_group" => self.handle_remove_extension_from_group(arguments).await,
+      "delete_extension" => self.handle_delete_extension_mcp(arguments).await,
+      "delete_extension_group" => self.handle_delete_extension_group_mcp(arguments).await,
+      "assign_extension_group_to_profile" => {
+        self
+          .handle_assign_extension_group_to_profile(arguments)
+          .await
+      }
+      // Cookie management
+      "import_profile_cookies" => self.handle_import_profile_cookies(arguments).await,
+      // Team lock tools
+      "get_team_locks" => self.handle_get_team_locks().await,
+      "get_team_lock_status" => self.handle_get_team_lock_status(arguments).await,
+      // Synchronizer tools
+      "start_sync_session" => {
+        Self::require_capability(
+          "Synchronizer",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_start_sync_session(arguments).await
+      }
+      "stop_sync_session" => self.handle_stop_sync_session(arguments).await,
+      "get_sync_sessions" => self.handle_get_sync_sessions().await,
+      "remove_sync_follower" => self.handle_remove_sync_follower(arguments).await,
+      // Browser interaction tools (require paid subscription)
+      "navigate" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_navigate(arguments).await
+      }
+      "screenshot" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_screenshot(arguments).await
+      }
+      "evaluate_javascript" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_evaluate_javascript(arguments).await
+      }
+      "click_element" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_click_element(arguments).await
+      }
+      "type_text" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_type_text(arguments).await
+      }
+      "get_page_content" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_get_page_content(arguments).await
+      }
+      "get_page_info" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_get_page_info(arguments).await
+      }
+      "get_interactive_elements" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_get_interactive_elements(arguments).await
+      }
+      "click_by_index" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_click_by_index(arguments).await
+      }
+      "type_by_index" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_type_by_index(arguments).await
+      }
+      // Leasing a host is the most expensive thing this server can do, so it
+      // is gated exactly like the local launch it replaces.
+      "run_profile_remote" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_run_profile_remote(arguments).await
+      }
+      // No capability gate on the stop. A lapsed plan must never be the reason
+      // an agent cannot end something that is spending hours.
+      "stop_remote_session" => Self::handle_stop_remote_session(arguments).await,
+      // Remote fleet observability. Reads only, and free: being unable to see
+      // that a session you are already paying for has become usable is not a
+      // feature worth withholding.
+      "list_remote_sessions" => Self::handle_list_remote_sessions().await,
+      "get_remote_session" => Self::handle_get_remote_session(arguments).await,
+      "get_remote_hours_quota" => Self::handle_get_remote_hours_quota().await,
+      // Cookie bot. Reading and configuring are free; only starting a run,
+      // which leases a host and spends the pooled hours, needs the plan.
+      "list_cookie_bot_schedules" => Self::handle_list_cookie_bot_schedules(arguments).await,
+      "get_cookie_bot_schedule" => Self::handle_get_cookie_bot_schedule(arguments).await,
+      "set_cookie_bot_schedule" => Self::handle_set_cookie_bot_schedule(arguments).await,
+      "delete_cookie_bot_schedule" => Self::handle_delete_cookie_bot_schedule(arguments).await,
+      "check_cookie_bot_conflicts" => Self::handle_check_cookie_bot_conflicts(arguments).await,
+      "list_cookie_bot_runs" => Self::handle_list_cookie_bot_runs(arguments).await,
+      "run_cookie_bot_now" => {
+        // The Cookie Bot, NOT browser automation. Solo pays for the bot and has
+        // no automation; gating this on automation refused a Solo customer the
+        // feature their plan is sold on while their scheduled runs kept firing.
+        Self::require_capability("Cookie Bot", CLOUD_AUTH.can_use_cookie_bot().await).await?;
+        Self::handle_run_cookie_bot_now(arguments).await
+      }
+      // No capability gate on the cancel. A lapsed plan must never be the
+      // reason an agent cannot stop something that is spending hours.
+      "cancel_cookie_bot_run" => Self::handle_cancel_cookie_bot_run(arguments).await,
+      "list_cookie_bot_presets" => Self::handle_list_cookie_bot_presets().await,
+      "get_cookie_bot_usage" => Self::handle_get_cookie_bot_usage(arguments).await,
+      _ => Err(McpError {
+        code: -32602,
+        message: format!("Unknown tool: {tool_name}"),
+      }),
+    }
+  }
+
+  async fn handle_list_profiles(&self) -> Result<serde_json::Value, McpError> {
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    // Filter to only Wayfern profiles
+    let filtered: Vec<&BrowserProfile> =
+      profiles.iter().filter(|p| p.browser == "wayfern").collect();
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&filtered).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_get_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    // Check if it's a Wayfern profile
+    if profile.browser != "wayfern" {
+      return Err(McpError {
+        code: -32000,
+        message: "MCP only supports Wayfern profiles".to_string(),
+      });
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&profile).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_run_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    // Launching profiles programmatically requires the automation capability.
+    Self::require_capability(
+      "Launching a profile",
+      CLOUD_AUTH.can_use_browser_automation().await,
+    )
+    .await?;
+
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let url = arguments.get("url").and_then(|v| v.as_str());
+    let headless = arguments
+      .get("headless")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+
+    // Get the profile
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    // Check if it's a Wayfern profile
+    if profile.browser != "wayfern" {
+      return Err(McpError {
+        code: -32000,
+        message: "MCP only supports Wayfern profiles".to_string(),
+      });
+    }
+
+    // Team lock check
+    crate::team_lock::acquire_team_lock_if_needed(profile)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e,
+      })?;
+
+    // Get app handle to launch
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    // Launch a fresh instance, honoring the requested headless mode. The CDP
+    // port is self-allocated and discovered later via get_cdp_port_for_profile.
+    crate::browser_runner::launch_browser_profile_impl(
+      app_handle.clone(),
+      profile.clone(),
+      url.map(|s| s.to_string()),
+      crate::browser_runner::LaunchOptions::automation(None, headless),
+    )
+    .await
+    .map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to launch browser: {e}"),
+    })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Browser profile '{}' launched successfully", profile.name)
+      }]
+    }))
+  }
+
+  async fn handle_kill_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    // Stopping profiles programmatically requires the automation capability.
+    Self::require_capability(
+      "Killing a profile",
+      CLOUD_AUTH.can_use_browser_automation().await,
+    )
+    .await?;
+
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    // Get the profile
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    // Check if it's a Wayfern profile
+    if profile.browser != "wayfern" {
+      return Err(McpError {
+        code: -32000,
+        message: "MCP only supports Wayfern profiles".to_string(),
+      });
+    }
+
+    // Get app handle to kill
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    // Kill the browser
+    crate::browser_runner::BrowserRunner::instance()
+      .kill_browser_process(app_handle.clone(), profile)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to kill browser: {e}"),
+      })?;
+
+    crate::team_lock::release_team_lock_if_needed(profile).await;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Browser profile '{}' stopped successfully", profile.name)
+      }]
+    }))
+  }
+
+  async fn handle_batch_run_profiles(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    Self::require_capability(
+      "Batch launching profiles",
+      CLOUD_AUTH.can_use_browser_automation().await,
+    )
+    .await?;
+
+    let profile_ids: Vec<String> = arguments
+      .get("profile_ids")
+      .and_then(|v| v.as_array())
+      .map(|a| {
+        a.iter()
+          .filter_map(|v| v.as_str().map(|s| s.to_string()))
+          .collect()
+      })
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_ids array".to_string(),
+      })?;
+
+    let url = arguments.get("url").and_then(|v| v.as_str());
+    let headless = arguments
+      .get("headless")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    // Clone the app handle and release the lock before the launch loop so we
+    // never hold the inner mutex across the per-profile awaits.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+        })?
+        .clone()
+    };
+
+    let mut launched = 0usize;
+    let mut lines: Vec<String> = Vec::with_capacity(profile_ids.len());
+    for profile_id in &profile_ids {
+      let Some(profile) = profiles.iter().find(|p| p.id.to_string() == *profile_id) else {
+        lines.push(format!("{profile_id}: not found"));
+        continue;
+      };
+      if profile.browser != "wayfern" {
+        lines.push(format!(
+          "{profile_id}: unsupported browser (MCP supports Wayfern)"
+        ));
+        continue;
+      }
+      if let Err(e) = crate::team_lock::acquire_team_lock_if_needed(profile).await {
+        lines.push(format!("{profile_id}: {e}"));
+        continue;
+      }
+      match crate::browser_runner::launch_browser_profile_impl(
+        app_handle.clone(),
+        profile.clone(),
+        url.map(|s| s.to_string()),
+        crate::browser_runner::LaunchOptions::automation(None, headless),
+      )
+      .await
+      {
+        Ok(_) => {
+          launched += 1;
+          lines.push(format!("{}: launched", profile.name));
+        }
+        Err(e) => lines.push(format!("{}: launch failed: {e}", profile.name)),
+      }
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Launched {}/{} profile(s):\n{}", launched, profile_ids.len(), lines.join("\n"))
+      }]
+    }))
+  }
+
+  async fn handle_batch_stop_profiles(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    Self::require_capability(
+      "Batch stopping profiles",
+      CLOUD_AUTH.can_use_browser_automation().await,
+    )
+    .await?;
+
+    let profile_ids: Vec<String> = arguments
+      .get("profile_ids")
+      .and_then(|v| v.as_array())
+      .map(|a| {
+        a.iter()
+          .filter_map(|v| v.as_str().map(|s| s.to_string()))
+          .collect()
+      })
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_ids array".to_string(),
+      })?;
+
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+        })?
+        .clone()
+    };
+
+    let mut stopped = 0usize;
+    let mut lines: Vec<String> = Vec::with_capacity(profile_ids.len());
+    for profile_id in &profile_ids {
+      let Some(profile) = profiles.iter().find(|p| p.id.to_string() == *profile_id) else {
+        lines.push(format!("{profile_id}: not found"));
+        continue;
+      };
+      match crate::browser_runner::BrowserRunner::instance()
+        .kill_browser_process(app_handle.clone(), profile)
+        .await
+      {
+        Ok(_) => {
+          crate::team_lock::release_team_lock_if_needed(profile).await;
+          stopped += 1;
+          lines.push(format!("{}: stopped", profile.name));
+        }
+        Err(e) => lines.push(format!("{}: stop failed: {e}", profile.name)),
+      }
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Stopped {}/{} profile(s):\n{}", stopped, profile_ids.len(), lines.join("\n"))
+      }]
+    }))
+  }
+
+  async fn handle_create_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing name".to_string(),
+      })?;
+    let browser = arguments
+      .get("browser")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing browser".to_string(),
+      })?;
+
+    if browser != "wayfern" {
+      return Err(McpError {
+        code: -32602,
+        message: "browser must be 'wayfern'".to_string(),
+      });
+    }
+
+    let proxy_id = arguments
+      .get("proxy_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let launch_hook = arguments
+      .get("launch_hook")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let tags: Option<Vec<String>> = arguments.get("tags").and_then(|v| {
+      v.as_array().map(|arr| {
+        arr
+          .iter()
+          .filter_map(|item| item.as_str().map(|s| s.to_string()))
+          .collect()
+      })
+    });
+
+    // Pick the latest downloaded version for this browser
+    let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+    let versions = registry.get_downloaded_versions(browser);
+    let version = versions.first().ok_or_else(|| McpError {
+      code: -32000,
+      message: format!("No downloaded version found for {browser}. Download it first."),
+    })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let mut profile = ProfileManager::instance()
+      .create_profile_with_group(
+        app_handle,
+        name,
+        browser,
+        version,
+        "stable",
+        proxy_id,
+        None,
+        None,
+        group_id,
+        false,
+        None,
+        launch_hook,
+      )
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to create profile: {e}"),
+      })?;
+
+    if let Some(tags) = tags {
+      let _ =
+        ProfileManager::instance().update_profile_tags(app_handle, &profile.name, tags.clone());
+      profile.tags = tags;
+      if let Ok(profiles) = ProfileManager::instance().list_profiles() {
+        let _ = crate::tag_manager::TAG_MANAGER
+          .lock()
+          .map(|manager| manager.rebuild_from_profiles(&profiles));
+      }
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Profile '{}' created (id: {})", profile.name, profile.id)
+      }]
+    }))
+  }
+
+  async fn handle_update_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+    let pm = ProfileManager::instance();
+
+    if let Some(new_name) = arguments.get("name").and_then(|v| v.as_str()) {
+      pm.rename_profile(app_handle, profile_id, new_name)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to rename profile: {e}"),
+        })?;
+    }
+
+    if let Some(proxy_id) = arguments.get("proxy_id").and_then(|v| v.as_str()) {
+      let pid = if proxy_id.is_empty() {
+        None
+      } else {
+        Some(proxy_id.to_string())
+      };
+      pm.update_profile_proxy(app_handle.clone(), profile_id, pid)
+        .await
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update proxy: {e}"),
+        })?;
+    }
+
+    if let Some(launch_hook) = arguments.get("launch_hook").and_then(|v| v.as_str()) {
+      let normalized = if launch_hook.is_empty() {
+        None
+      } else {
+        Some(launch_hook.to_string())
+      };
+      pm.update_profile_launch_hook(app_handle, profile_id, normalized)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update launch hook: {e}"),
+        })?;
+    }
+
+    if let Some(group_id) = arguments.get("group_id").and_then(|v| v.as_str()) {
+      let gid = if group_id.is_empty() {
+        None
+      } else {
+        Some(group_id.to_string())
+      };
+      pm.assign_profiles_to_group(app_handle, vec![profile_id.to_string()], gid)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update group: {e}"),
+        })?;
+    }
+
+    if let Some(tags) = arguments.get("tags").and_then(|v| v.as_array()) {
+      let tag_list: Vec<String> = tags
+        .iter()
+        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+        .collect();
+      pm.update_profile_tags(app_handle, profile_id, tag_list)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update tags: {e}"),
+        })?;
+      if let Ok(profiles) = pm.list_profiles() {
+        let _ = crate::tag_manager::TAG_MANAGER
+          .lock()
+          .map(|manager| manager.rebuild_from_profiles(&profiles));
+      }
+    }
+
+    if let Some(ext_group_id) = arguments.get("extension_group_id").and_then(|v| v.as_str()) {
+      let eid = if ext_group_id.is_empty() {
+        None
+      } else {
+        Some(ext_group_id.to_string())
+      };
+      pm.update_profile_extension_group(profile_id, eid)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update extension group: {e}"),
+        })?;
+    }
+
+    if let Some(rules) = arguments
+      .get("proxy_bypass_rules")
+      .and_then(|v| v.as_array())
+    {
+      let rule_list: Vec<String> = rules
+        .iter()
+        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+        .collect();
+      pm.update_profile_proxy_bypass_rules(app_handle, profile_id, rule_list)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update proxy bypass rules: {e}"),
+        })?;
+    }
+
+    if let Some(clear_on_close) = arguments.get("clear_on_close").and_then(|v| v.as_bool()) {
+      pm.update_profile_clear_on_close(app_handle, profile_id, clear_on_close)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update clear-on-close: {e}"),
+        })?;
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Profile '{profile_id}' updated successfully")
+      }]
+    }))
+  }
+
+  async fn handle_delete_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    ProfileManager::instance()
+      .delete_profile(app_handle, profile_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to delete profile: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Profile '{profile_id}' deleted successfully")
+      }]
+    }))
+  }
+
+  async fn handle_list_tags(&self) -> Result<serde_json::Value, McpError> {
+    let tags = crate::tag_manager::TAG_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to access tag manager: {e}"),
+      })?
+      .get_all_tags()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to get tags: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&tags).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_list_proxies(&self) -> Result<serde_json::Value, McpError> {
+    let proxies = PROXY_MANAGER.get_stored_proxies();
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&proxies).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_get_profile_status(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    // Get the profile
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    // Check if it's a Wayfern profile
+    if profile.browser != "wayfern" {
+      return Err(McpError {
+        code: -32000,
+        message: "MCP only supports Wayfern profiles".to_string(),
+      });
+    }
+
+    // "Running" has to mean "drivable", not "has a process on this machine".
+    // A profile open on the leased fleet has no local process, and answering
+    // `is_running: false` for it tells an agent not to bother calling the very
+    // tools that would have worked.
+    let is_running_locally = profile.process_id.is_some();
+    let remote_session = if is_running_locally {
+      None
+    } else {
+      crate::remote_session::live_session_for_profile(profile_id).await
+    };
+
+    let location = match (is_running_locally, &remote_session) {
+      (true, _) => "local",
+      (false, Some(_)) => "remote",
+      (false, None) => "stopped",
+    };
+
+    // Whether a LOCAL launch would be refused, and why. An agent that reads
+    // `location: "stopped"` and calls `run_profile` on a profile whose finished
+    // remote session has not been pulled back would get a bare 409 with nothing
+    // to act on; worse, before the gate existed it would have got a browser and
+    // silently destroyed the session's work.
+    let handoff = crate::remote_handoff::state_for(profile_id);
+    let can_launch_locally = handoff.is_none() && !is_running_locally;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::json!({
+          "profile_id": profile_id,
+          "is_running": location != "stopped",
+          "is_running_locally": is_running_locally,
+          "location": location,
+          "remote_session_id": remote_session.map(|session| session.session_id),
+          "can_launch_locally": can_launch_locally,
+          "local_launch_blocked_by": match handoff {
+            Some(crate::remote_handoff::HandoffState::Running) => Some("remote_session_running"),
+            Some(crate::remote_handoff::HandoffState::PendingSync) => {
+              Some("remote_session_changes_downloading")
+            }
+            None => None,
+          },
+        }).to_string()
+      }]
+    }))
+  }
+
+  // Group management handlers
+  async fn handle_list_groups(&self) -> Result<serde_json::Value, McpError> {
+    let groups = GROUP_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock group manager: {e}"),
+      })?
+      .get_all_groups()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list groups: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&groups).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_get_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing group_id".to_string(),
+      })?;
+
+    let groups = GROUP_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock group manager: {e}"),
+      })?
+      .get_all_groups()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list groups: {e}"),
+      })?;
+
+    let group = groups
+      .iter()
+      .find(|g| g.id == group_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Group not found: {group_id}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&group).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_create_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing name".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let group = GROUP_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock group manager: {e}"),
+      })?
+      .create_group(app_handle, name.to_string())
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to create group: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Group '{}' created successfully with ID: {}", group.name, group.id)
+      }]
+    }))
+  }
+
+  async fn handle_update_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing group_id".to_string(),
+      })?;
+
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing name".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let group = GROUP_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock group manager: {e}"),
+      })?
+      .update_group(app_handle, group_id.to_string(), name.to_string())
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to update group: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Group '{}' updated successfully", group.name)
+      }]
+    }))
+  }
+
+  async fn handle_delete_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing group_id".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    GROUP_MANAGER
+      .lock()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock group manager: {e}"),
+      })?
+      .delete_group(app_handle, group_id.to_string())
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to delete group: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Group '{}' deleted successfully", group_id)
+      }]
+    }))
+  }
+
+  async fn handle_assign_profiles_to_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_ids: Vec<String> = arguments
+      .get("profile_ids")
+      .and_then(|v| v.as_array())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_ids".to_string(),
+      })?
+      .iter()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect();
+
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    ProfileManager::instance()
+      .assign_profiles_to_group(app_handle, profile_ids.clone(), group_id.clone())
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to assign profiles to group: {e}"),
+      })?;
+
+    let group_name = group_id.as_deref().unwrap_or("default");
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("{} profile(s) assigned to group '{}'", profile_ids.len(), group_name)
+      }]
+    }))
+  }
+
+  // Full proxy management handlers
+  async fn handle_get_proxy(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let proxy_id = arguments
+      .get("proxy_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing proxy_id".to_string(),
+      })?;
+
+    let proxies = PROXY_MANAGER.get_stored_proxies();
+    let proxy = proxies
+      .iter()
+      .find(|p| p.id == proxy_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Proxy not found: {proxy_id}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&proxy).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_create_proxy(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing name".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let proxy_type = arguments
+      .get("proxy_type")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing proxy_type".to_string(),
+      })?;
+
+    // The tool schema declares an enum, but JSON-Schema enums are advisory only;
+    // enforce it here so a bad value can't produce a non-functional proxy.
+    if !matches!(proxy_type, "http" | "https" | "socks4" | "socks5" | "vless") {
+      return Err(McpError {
+        code: -32602,
+        message: "proxy_type must be one of: http, https, socks4, socks5, vless".to_string(),
+      });
+    }
+
+    let vless_uri = arguments
+      .get("vless_uri")
+      .and_then(|value| value.as_str())
+      .map(str::to_string);
+    let (host, port) = if proxy_type == "vless" {
+      if vless_uri.is_none() {
+        return Err(McpError {
+          code: -32602,
+          message: "Missing vless_uri".to_string(),
+        });
+      }
+      (String::new(), 1)
+    } else {
+      let host = arguments
+        .get("host")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| McpError {
+          code: -32602,
+          message: "Missing host".to_string(),
+        })?
+        .to_string();
+      let port = arguments
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| McpError {
+          code: -32602,
+          message: "Missing or invalid port".to_string(),
+        })?;
+      (host, port)
+    };
+
+    let username = arguments
+      .get("username")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let password = arguments
+      .get("password")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let proxy_settings = ProxySettings {
+      proxy_type: proxy_type.to_string(),
+      host,
+      port,
+      username,
+      password,
+      vless_uri,
+    };
+
+    let proxy = PROXY_MANAGER
+      .create_stored_proxy(app_handle, name.to_string(), proxy_settings)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to create proxy: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Proxy '{}' created successfully with ID: {}", proxy.name, proxy.id)
+      }]
+    }))
+  }
+
+  async fn handle_update_proxy(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let proxy_id = arguments
+      .get("proxy_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing proxy_id".to_string(),
+      })?;
+
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    // Build proxy_settings if any settings fields are provided
+    let has_settings = arguments.get("proxy_type").is_some()
+      || arguments.get("host").is_some()
+      || arguments.get("port").is_some()
+      || arguments.get("username").is_some()
+      || arguments.get("password").is_some()
+      || arguments.get("vless_uri").is_some();
+
+    let proxy_settings = if has_settings {
+      // Get existing proxy to use as defaults
+      let proxies = PROXY_MANAGER.get_stored_proxies();
+      let existing = proxies
+        .iter()
+        .find(|p| p.id == proxy_id)
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: format!("Proxy not found: {proxy_id}"),
+        })?;
+
+      let proxy_type = arguments
+        .get("proxy_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| existing.proxy_settings.proxy_type.clone());
+      if !matches!(
+        proxy_type.as_str(),
+        "http" | "https" | "socks4" | "socks5" | "vless"
+      ) {
+        return Err(McpError {
+          code: -32602,
+          message: "proxy_type must be one of: http, https, socks4, socks5, vless".to_string(),
+        });
+      }
+
+      let host = arguments
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| existing.proxy_settings.host.clone());
+
+      let port = match arguments.get("port") {
+        Some(value) => value
+          .as_u64()
+          .and_then(|port| u16::try_from(port).ok())
+          .filter(|port| *port != 0)
+          .ok_or_else(|| McpError {
+            code: -32602,
+            message: "Invalid port".to_string(),
+          })?,
+        None => existing.proxy_settings.port,
+      };
+
+      let username = arguments
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| existing.proxy_settings.username.clone());
+
+      let password = arguments
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| existing.proxy_settings.password.clone());
+      let vless_uri = arguments
+        .get("vless_uri")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| existing.proxy_settings.vless_uri.clone());
+
+      Some(ProxySettings {
+        proxy_type,
+        host,
+        port,
+        username,
+        password,
+        vless_uri,
+      })
+    } else {
+      None
+    };
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let proxy = PROXY_MANAGER
+      .update_stored_proxy(app_handle, proxy_id, name, proxy_settings)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to update proxy: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Proxy '{}' updated successfully", proxy.name)
+      }]
+    }))
+  }
+
+  async fn handle_delete_proxy(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let proxy_id = arguments
+      .get("proxy_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing proxy_id".to_string(),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    PROXY_MANAGER
+      .delete_stored_proxy(app_handle, proxy_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to delete proxy: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Proxy '{}' deleted successfully", proxy_id)
+      }]
+    }))
+  }
+
+  async fn handle_export_proxies(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let format = arguments
+      .get("format")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing format".to_string(),
+      })?;
+
+    let content = match format {
+      "json" => PROXY_MANAGER.export_proxies_json().map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to export proxies: {e}"),
+      })?,
+      "txt" => PROXY_MANAGER.export_proxies_txt(),
+      _ => {
+        return Err(McpError {
+          code: -32602,
+          message: format!("Invalid format '{}', must be 'json' or 'txt'", format),
+        })
+      }
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": content
+      }]
+    }))
+  }
+
+  async fn handle_import_proxies(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let content = arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing content".to_string(),
+      })?;
+
+    let format = arguments
+      .get("format")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing format".to_string(),
+      })?;
+
+    let name_prefix = arguments
+      .get("name_prefix")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let result = match format {
+      "json" => PROXY_MANAGER
+        .import_proxies_json(app_handle, content)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to import proxies: {e}"),
+        })?,
+      "txt" => {
+        use crate::proxy_manager::{ProxyManager, ProxyParseResult};
+
+        let parse_results = ProxyManager::parse_txt_proxies(content);
+        let parsed: Vec<_> = parse_results
+          .into_iter()
+          .filter_map(|r| {
+            if let ProxyParseResult::Parsed(p) = r {
+              Some(p)
+            } else {
+              None
+            }
+          })
+          .collect();
+
+        if parsed.is_empty() {
+          return Err(McpError {
+            code: -32000,
+            message: "No valid proxies found in content".to_string(),
+          });
+        }
+
+        PROXY_MANAGER
+          .import_proxies_from_parsed(app_handle, parsed, name_prefix)
+          .map_err(|e| McpError {
+            code: -32000,
+            message: format!("Failed to import proxies: {e}"),
+          })?
+      }
+      _ => {
+        return Err(McpError {
+          code: -32602,
+          message: format!("Invalid format '{}', must be 'json' or 'txt'", format),
+        })
+      }
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "Import complete: {} imported, {} skipped, {} errors",
+          result.imported_count,
+          result.skipped_count,
+          result.errors.len()
+        )
+      }]
+    }))
+  }
+
+  // Profile import handlers
+  async fn handle_detect_browser_profiles(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let importer = crate::profile_importer::ProfileImporter::instance();
+    let profiles = match arguments.get("folder").and_then(|v| v.as_str()) {
+      Some(folder) => importer.scan_folder(std::path::Path::new(folder)),
+      None => importer.detect_existing_profiles(),
+    }
+    .map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to detect profiles: {e}"),
+    })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&profiles).unwrap_or_else(|_| "[]".to_string())
+      }]
+    }))
+  }
+
+  async fn handle_import_browser_profiles(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let items: Vec<crate::profile_importer::ImportProfileItem> = arguments
+      .get("items")
+      .cloned()
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing items".to_string(),
+      })
+      .and_then(|v| {
+        serde_json::from_value(v).map_err(|e| McpError {
+          code: -32602,
+          message: format!("Invalid items: {e}"),
+        })
+      })?;
+
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let duplicate_strategy = arguments
+      .get("duplicate_strategy")
+      .cloned()
+      .map(serde_json::from_value::<crate::profile_importer::DuplicateStrategy>)
+      .transpose()
+      .map_err(|e| McpError {
+        code: -32602,
+        message: format!("Invalid duplicate_strategy: {e}"),
+      })?
+      .unwrap_or_default();
+
+    // Clone the handle instead of holding the inner lock across a potentially
+    // multi-GB copy.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner.app_handle.clone().ok_or_else(|| McpError {
+        code: -32000,
+        message: "MCP server not properly initialized".to_string(),
+      })?
+    };
+
+    let result = crate::profile_importer::ProfileImporter::instance()
+      .import_profiles(&app_handle, items, group_id, duplicate_strategy, None)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to import profiles: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "Import complete: {} imported, {} skipped, {} failed\n{}",
+          result.imported_count,
+          result.skipped_count,
+          result.failed_count,
+          serde_json::to_string_pretty(&result.results).unwrap_or_default()
+        )
+      }]
+    }))
+  }
+
+  // Cookie management handlers
+  async fn handle_import_profile_cookies(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let content = arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing content".to_string(),
+      })?;
+
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+        })?
+        .clone()
+    };
+
+    let result =
+      crate::cookie_manager::CookieManager::import_cookies(&app_handle, profile_id, content)
+        .await
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to import cookies: {e}"),
+        })?;
+
+    if let Some(scheduler) = crate::sync::get_global_scheduler() {
+      let profile_manager = crate::profile::manager::ProfileManager::instance();
+      if let Ok(profiles) = profile_manager.list_profiles() {
+        if let Some(profile) = profiles.iter().find(|p| p.id.to_string() == profile_id) {
+          if profile.is_sync_enabled() {
+            let pid = profile_id.to_string();
+            tauri::async_runtime::spawn(async move {
+              scheduler.queue_profile_sync(pid).await;
+            });
+          }
+        }
+      }
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "Import complete: {} imported, {} replaced, {} parse error(s)",
+          result.cookies_imported,
+          result.cookies_replaced,
+          result.errors.len()
+        )
+      }]
+    }))
+  }
+
+  // VPN management handlers
+  async fn handle_import_vpn(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let content = arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing content".to_string(),
+      })?;
+
+    let filename = arguments
+      .get("filename")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing filename".to_string(),
+      })?;
+
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to lock VPN storage: {e}"),
+    })?;
+
+    let config = storage
+      .import_config(content, filename, name)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to import VPN config: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "VPN '{}' ({}) imported successfully with ID: {}",
+          config.name,
+          config.vpn_type,
+          config.id
+        )
+      }]
+    }))
+  }
+
+  async fn handle_list_vpn_configs(&self) -> Result<serde_json::Value, McpError> {
+    let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to lock VPN storage: {e}"),
+    })?;
+
+    let configs = storage.list_configs().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to list VPN configs: {e}"),
+    })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&configs).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_delete_vpn(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let vpn_id = arguments
+      .get("vpn_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing vpn_id".to_string(),
+      })?;
+
+    // First disconnect if connected (stop VPN worker)
+    let _ = crate::vpn_worker_runner::stop_vpn_worker_by_vpn_id(vpn_id).await;
+
+    let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to lock VPN storage: {e}"),
+    })?;
+
+    storage.delete_config(vpn_id).map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to delete VPN config: {e}"),
+    })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("VPN '{}' deleted successfully", vpn_id)
+      }]
+    }))
+  }
+
+  async fn handle_connect_vpn(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let vpn_id = arguments
+      .get("vpn_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing vpn_id".to_string(),
+      })?;
+
+    // Start VPN worker process
+    crate::vpn_worker_runner::start_vpn_worker(vpn_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to connect VPN: {e}"),
+      })?;
+
+    // Update last_used timestamp
+    {
+      let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to lock VPN storage: {e}"),
+      })?;
+      let _ = storage.update_last_used(vpn_id);
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("VPN '{}' connected successfully", vpn_id)
+      }]
+    }))
+  }
+
+  async fn handle_disconnect_vpn(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let vpn_id = arguments
+      .get("vpn_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing vpn_id".to_string(),
+      })?;
+
+    crate::vpn_worker_runner::stop_vpn_worker_by_vpn_id(vpn_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to disconnect VPN: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("VPN '{}' disconnected successfully", vpn_id)
+      }]
+    }))
+  }
+
+  async fn handle_get_vpn_status(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let vpn_id = arguments
+      .get("vpn_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing vpn_id".to_string(),
+      })?;
+
+    let connected =
+      if let Some(worker) = crate::vpn_worker_storage::find_vpn_worker_by_vpn_id(vpn_id) {
+        worker
+          .pid
+          .map(crate::proxy_storage::is_process_running)
+          .unwrap_or(false)
+      } else {
+        false
+      };
+
+    let status = crate::vpn::VpnStatus {
+      connected,
+      vpn_id: vpn_id.to_string(),
+      connected_at: None,
+      bytes_sent: None,
+      bytes_received: None,
+      last_handshake: None,
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&status).unwrap_or_default()
+      }]
+    }))
+  }
+
+  // Fingerprint management handlers
+  async fn handle_get_profile_fingerprint(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    let fingerprint_info = match profile.browser.as_str() {
+      "wayfern" => {
+        let config = profile.wayfern_config.as_ref().cloned().unwrap_or_default();
+        serde_json::json!({
+          "browser": "wayfern",
+          "fingerprint": config.fingerprint,
+          "os": config.os,
+          "randomize_fingerprint_on_launch": config.randomize_fingerprint_on_launch,
+          "screen_max_width": config.screen_max_width,
+          "screen_max_height": config.screen_max_height,
+          "screen_min_width": config.screen_min_width,
+          "screen_min_height": config.screen_min_height,
+        })
+      }
+      _ => {
+        return Err(McpError {
+          code: -32000,
+          message: "MCP only supports Wayfern profiles".to_string(),
+        })
+      }
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&fingerprint_info).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_update_profile_fingerprint(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.can_use_cross_os_fingerprints().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Fingerprint editing requires a plan that includes it".to_string(),
+      });
+    }
+
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let fingerprint = arguments.get("fingerprint").and_then(|v| v.as_str());
+    let os = arguments.get("os").and_then(|v| v.as_str());
+    let randomize = arguments
+      .get("randomize_fingerprint_on_launch")
+      .and_then(|v| v.as_bool());
+
+    if let Some(os_val) = os {
+      if !CLOUD_AUTH.is_fingerprint_os_allowed(Some(os_val)).await {
+        return Err(McpError {
+          code: -32000,
+          message: format!(
+            "OS spoofing to '{}' requires an active Pro subscription",
+            os_val
+          ),
+        });
+      }
+    }
+
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    match profile.browser.as_str() {
+      "wayfern" => {
+        let mut config = profile.wayfern_config.as_ref().cloned().unwrap_or_default();
+        if let Some(fp) = fingerprint {
+          config.fingerprint = Some(fp.to_string());
+        }
+        if let Some(os_val) = os {
+          config.os = Some(os_val.to_string());
+        }
+        if let Some(r) = randomize {
+          config.randomize_fingerprint_on_launch = Some(r);
+        }
+        ProfileManager::instance()
+          .update_wayfern_config(app_handle.clone(), profile_id, config)
+          .await
+          .map_err(|e| McpError {
+            code: -32000,
+            message: format!("Failed to update wayfern config: {e}"),
+          })?;
+      }
+      _ => {
+        return Err(McpError {
+          code: -32000,
+          message: "MCP only supports Wayfern profiles".to_string(),
+        })
+      }
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Fingerprint configuration updated for profile '{}'", profile.name)
+      }]
+    }))
+  }
+
+  async fn handle_update_profile_proxy_bypass_rules(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let rules: Vec<String> = arguments
+      .get("rules")
+      .and_then(|v| v.as_array())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing rules array".to_string(),
+      })?
+      .iter()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect();
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+
+    let profile = ProfileManager::instance()
+      .update_profile_proxy_bypass_rules(app_handle, profile_id, rules.clone())
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to update proxy bypass rules: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "Proxy bypass rules updated for profile '{}': {} rule(s) configured",
+          profile.name,
+          rules.len()
+        )
+      }]
+    }))
+  }
+
+  async fn handle_update_profile_dns_blocklist(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let level = arguments
+      .get("level")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing level".to_string(),
+      })?;
+
+    let dns_blocklist = if level == "none" {
+      None
+    } else {
+      Some(level.to_string())
+    };
+
+    let profile = ProfileManager::instance()
+      .update_profile_dns_blocklist(profile_id, dns_blocklist)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to update DNS blocklist: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "DNS blocklist updated for profile '{}': {}",
+          profile.name,
+          level
+        )
+      }]
+    }))
+  }
+
+  async fn handle_get_dns_blocklist_status(&self) -> Result<serde_json::Value, McpError> {
+    let statuses = crate::dns_blocklist::BlocklistManager::get_cache_status();
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&statuses).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_list_extensions(&self) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let extensions = mgr.list_extensions().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to list extensions: {e}"),
+    })?;
+    Ok(serde_json::to_value(extensions).unwrap())
+  }
+
+  async fn handle_list_extension_groups(&self) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let groups = mgr.list_groups().map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to list extension groups: {e}"),
+    })?;
+    Ok(serde_json::to_value(groups).unwrap())
+  }
+
+  async fn handle_add_extension(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let path = arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: path".to_string(),
+      })?;
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .unwrap_or_default()
+      .to_string();
+    let link = arguments
+      .get("link")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let extension = mgr
+      .add_extension_from_path(name, std::path::Path::new(path), link)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to add extension: {e}"),
+      })?;
+    Ok(serde_json::to_value(extension).unwrap())
+  }
+
+  async fn handle_update_extension(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let extension_id = arguments
+      .get("extension_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: extension_id".to_string(),
+      })?;
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .map(str::to_string);
+    let path = arguments.get("path").and_then(|v| v.as_str());
+    if name.is_none() && path.is_none() {
+      return Err(McpError {
+        code: -32602,
+        message: "Provide at least one of: name, path".to_string(),
+      });
+    }
+    let link = arguments
+      .get("link")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let extension = match path {
+      Some(path) => {
+        mgr.update_extension_from_path(extension_id, name, std::path::Path::new(path), link)
+      }
+      None => mgr.update_extension(extension_id, name, None, None),
+    }
+    .map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to update extension: {e}"),
+    })?;
+    Ok(serde_json::to_value(extension).unwrap())
+  }
+
+  async fn handle_create_extension_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: name".to_string(),
+      })?;
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let group = mgr.create_group(name.to_string()).map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to create extension group: {e}"),
+    })?;
+    Ok(serde_json::to_value(group).unwrap())
+  }
+
+  async fn handle_update_extension_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: group_id".to_string(),
+      })?;
+    let name = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .map(str::to_string);
+    let extension_ids = arguments
+      .get("extension_ids")
+      .and_then(|v| v.as_array())
+      .map(|ids| {
+        ids
+          .iter()
+          .filter_map(|id| id.as_str().map(str::to_string))
+          .collect::<Vec<String>>()
+      });
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let group = mgr
+      .update_group(group_id, name, extension_ids)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to update extension group: {e}"),
+      })?;
+    Ok(serde_json::to_value(group).unwrap())
+  }
+
+  async fn handle_add_extension_to_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let group = mgr
+      .add_extension_to_group(group_id, extension_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to add extension to group: {e}"),
+      })?;
+    Ok(serde_json::to_value(group).unwrap())
+  }
+
+  async fn handle_remove_extension_from_group(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    let group = mgr
+      .remove_extension_from_group(group_id, extension_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to remove extension from group: {e}"),
+      })?;
+    Ok(serde_json::to_value(group).unwrap())
+  }
+
+  fn group_and_extension_ids(arguments: &serde_json::Value) -> Result<(&str, &str), McpError> {
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: group_id".to_string(),
+      })?;
+    let extension_id = arguments
+      .get("extension_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: extension_id".to_string(),
+      })?;
+    Ok((group_id, extension_id))
+  }
+
+  async fn handle_delete_extension_mcp(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let extension_id = arguments
+      .get("extension_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: extension_id".to_string(),
+      })?;
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    mgr
+      .delete_extension_internal(extension_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to delete extension: {e}"),
+      })?;
+    Ok(serde_json::json!({"success": true}))
+  }
+
+  async fn handle_delete_extension_group_mcp(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let group_id = arguments
+      .get("group_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: group_id".to_string(),
+      })?;
+    let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+    // For MCP, we don't have an app_handle, but we need one for sync deletion.
+    // Use the delete_group_internal which skips sync remote deletion.
+    mgr.delete_group_internal(group_id).map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to delete extension group: {e}"),
+    })?;
+    if let Err(e) = crate::events::emit_empty("extensions-changed") {
+      log::error!("Failed to emit extensions-changed event: {e}");
+    }
+    Ok(serde_json::json!({"success": true}))
+  }
+
+  async fn handle_assign_extension_group_to_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.has_active_paid_subscription().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Extension management requires an active Pro subscription".to_string(),
+      });
+    }
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing required parameter: profile_id".to_string(),
+      })?;
+    let extension_group_id = arguments
+      .get("extension_group_id")
+      .and_then(|v| v.as_str())
+      .map(|s| {
+        if s.is_empty() {
+          None
+        } else {
+          Some(s.to_string())
+        }
+      })
+      .unwrap_or(None);
+
+    // Validate compatibility if assigning
+    if let Some(ref gid) = extension_group_id {
+      let profile_manager = ProfileManager::instance();
+      let profiles = profile_manager.list_profiles().map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+      let profile = profiles
+        .iter()
+        .find(|p| p.id.to_string() == profile_id)
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: format!("Profile '{profile_id}' not found"),
+        })?;
+      let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      mgr
+        .validate_group_compatibility(gid, &profile.browser)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("{e}"),
+        })?;
+    }
+
+    let profile_manager = ProfileManager::instance();
+    let profile = profile_manager
+      .update_profile_extension_group(profile_id, extension_group_id)
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to assign extension group: {e}"),
+      })?;
+    Ok(serde_json::to_value(profile).unwrap())
+  }
+
+  async fn handle_get_team_locks(&self) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.is_on_team_plan().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Team features require an active team plan".to_string(),
+      });
+    }
+    let locks = crate::team_lock::TEAM_LOCK.get_locks().await;
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&locks).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_get_team_lock_status(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    if !CLOUD_AUTH.is_on_team_plan().await {
+      return Err(McpError {
+        code: -32000,
+        message: "Team features require an active team plan".to_string(),
+      });
+    }
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let lock_status = crate::team_lock::TEAM_LOCK
+      .get_lock_status(profile_id)
+      .await;
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&lock_status).unwrap_or_default()
+      }]
+    }))
+  }
+
+  // --- CDP utility methods for browser interaction ---
+
+  /// Where this profile's browser is: on this machine, or on the fleet.
+  ///
+  /// Every interaction tool goes through here, so a profile launched with
+  /// `run-remote` is driven by exactly the tools that drive a local one. The
+  /// alternative — a parallel set of remote-only tools — drifts from the local
+  /// set within a release and doubles every future change.
+  async fn resolve_cdp_target(&self, profile_id: &str) -> Result<CdpTarget, McpError> {
+    let profile = self.get_wayfern_profile(profile_id)?;
+    crate::cdp_target::resolve(&profile)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e.to_string(),
+      })
+  }
+
+  async fn send_cdp(
+    &self,
+    target: &CdpTarget,
+    method: &str,
+    params: serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    crate::cdp_target::run_command(target, method, params)
+      .await
+      .map_err(cdp_error)
+  }
+
+  async fn send_human_keystrokes(
+    &self,
+    target: &CdpTarget,
+    text: &str,
+    wpm: Option<f64>,
+  ) -> Result<(), McpError> {
+    use crate::human_typing::{MarkovTyper, TypingAction};
+
+    let events = MarkovTyper::new(text, wpm).run();
+    let mut connection = target.connect().await.map_err(cdp_error)?;
+
+    let mut cmd_id = 1u64;
+    let mut last_time = 0.0;
+
+    for event in &events {
+      let delay = event.time - last_time;
+      if delay > 0.0 {
+        tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
+      }
+      last_time = event.time;
+
+      let (down, up) = match &event.action {
+        TypingAction::Char(ch) => {
+          let ch = ch.to_string();
+          (
+            serde_json::json!({
+              "type": "keyDown",
+              "text": ch,
+              "key": ch,
+              "unmodifiedText": ch,
+            }),
+            serde_json::json!({ "type": "keyUp", "key": ch }),
+          )
+        }
+        TypingAction::Backspace => (
+          serde_json::json!({
+            "type": "keyDown",
+            "key": "Backspace",
+            "code": "Backspace",
+            "windowsVirtualKeyCode": 8,
+            "nativeVirtualKeyCode": 8,
+          }),
+          serde_json::json!({
+            "type": "keyUp",
+            "key": "Backspace",
+            "code": "Backspace",
+            "windowsVirtualKeyCode": 8,
+            "nativeVirtualKeyCode": 8,
+          }),
+        ),
+      };
+
+      for params in [down, up] {
+        if let Err(e) = connection
+          .send_command(cmd_id, "Input.dispatchKeyEvent", params)
+          .await
+        {
+          return Err(cdp_error(e));
+        }
+        // Drained rather than matched: the point is to keep reading so the
+        // browser is never writing into a full socket while the next keystroke
+        // is being timed. Bounded, because a reply that never comes must not
+        // freeze typing forever — the keystroke itself was already delivered.
+        let _ = tokio::time::timeout(KEYSTROKE_ACK_TIMEOUT, connection.next_text()).await;
+        cmd_id += 1;
+      }
+    }
+
+    connection.close().await;
+    Ok(())
+  }
+
+  /// Send a CDP command and wait for the page to finish loading.
+  ///
+  /// Thin over the shared runner so a local and a remote profile take exactly
+  /// the same path: one implementation of "navigate then wait", not two that
+  /// drift.
+  async fn send_cdp_and_wait_for_load(
+    &self,
+    target: &CdpTarget,
+    method: &str,
+    params: serde_json::Value,
+    timeout_secs: u64,
+  ) -> Result<serde_json::Value, McpError> {
+    crate::cdp_target::run_command_awaiting_load(target, method, params, timeout_secs)
+      .await
+      .map_err(cdp_error)
+  }
+
+  /// The profile a browser-interaction tool refers to.
+  ///
+  /// Deliberately does NOT require a local process. That check used to live
+  /// here, and it is exactly the state a profile running on the fleet is in, so
+  /// it refused every remote tool call before resolution had a chance to find
+  /// the session. Whether a browser exists at all is [`resolve_cdp_target`]'s
+  /// answer to give, because only it can see both places one could be.
+  fn get_wayfern_profile(&self, profile_id: &str) -> Result<BrowserProfile, McpError> {
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    if profile.browser != "wayfern" {
+      return Err(McpError {
+        code: -32000,
+        message: "MCP only supports Wayfern profiles".to_string(),
+      });
+    }
+
+    Ok(profile)
+  }
+
+  // --- Browser interaction handlers ---
+
+  async fn handle_navigate(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let url = arguments
+      .get("url")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing url".to_string(),
+      })?;
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    self
+      .send_cdp_and_wait_for_load(
+        &target,
+        "Page.navigate",
+        serde_json::json!({ "url": url }),
+        30,
+      )
+      .await?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Navigated to {url}")
+      }]
+    }))
+  }
+
+  async fn handle_screenshot(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let format = arguments
+      .get("format")
+      .and_then(|v| v.as_str())
+      .unwrap_or("png");
+    let quality = arguments.get("quality").and_then(|v| v.as_i64());
+    let full_page = arguments
+      .get("full_page")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let mut params = serde_json::json!({ "format": format });
+
+    if let Some(q) = quality {
+      params["quality"] = serde_json::json!(q);
+    }
+
+    if full_page {
+      let layout = self
+        .send_cdp(&target, "Page.getLayoutMetrics", serde_json::json!({}))
+        .await?;
+
+      if let Some(content_size) = layout.get("contentSize") {
+        params["clip"] = serde_json::json!({
+          "x": 0,
+          "y": 0,
+          "width": content_size.get("width").and_then(|v| v.as_f64()).unwrap_or(1920.0),
+          "height": content_size.get("height").and_then(|v| v.as_f64()).unwrap_or(1080.0),
+          "scale": 1
+        });
+        params["captureBeyondViewport"] = serde_json::json!(true);
+      }
+    }
+
+    let result = self
+      .send_cdp(&target, "Page.captureScreenshot", params)
+      .await?;
+
+    let data = result
+      .get("data")
+      .and_then(|v| v.as_str())
+      .unwrap_or_default();
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "image",
+        "data": data,
+        "mimeType": format!("image/{format}")
+      }]
+    }))
+  }
+
+  async fn handle_evaluate_javascript(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let expression = arguments
+      .get("expression")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing expression".to_string(),
+      })?;
+    let await_promise = arguments
+      .get("await_promise")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let wait_for_load = arguments
+      .get("wait_for_load")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let cdp_params = serde_json::json!({
+      "expression": expression,
+      "returnByValue": true,
+      "awaitPromise": await_promise,
+    });
+
+    let result = if wait_for_load {
+      self
+        .send_cdp_and_wait_for_load(&target, "Runtime.evaluate", cdp_params, 30)
+        .await?
+    } else {
+      self
+        .send_cdp(&target, "Runtime.evaluate", cdp_params)
+        .await?
+    };
+
+    let value = if let Some(exception) = result.get("exceptionDetails") {
+      let text = exception
+        .get("text")
+        .or_else(|| {
+          exception
+            .get("exception")
+            .and_then(|e| e.get("description"))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error");
+      serde_json::json!({ "error": text })
+    } else if let Some(r) = result.get("result") {
+      let val = r.get("value").cloned().unwrap_or(serde_json::json!(null));
+      serde_json::json!({ "value": val, "type": r.get("type") })
+    } else {
+      serde_json::json!({ "value": null })
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&value).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_click_element(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let selector = arguments
+      .get("selector")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing selector".to_string(),
+      })?;
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let selector_escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let js = format!(
+      r#"(() => {{
+        const el = document.querySelector('{}');
+        if (!el) throw new Error('Element not found: {}');
+        el.scrollIntoView({{block: 'center'}});
+        el.click();
+        return true;
+      }})()"#,
+      selector_escaped, selector_escaped
+    );
+
+    // Use send_cdp_and_wait_for_load: if the click triggers navigation,
+    // we wait for the new page to load. If not, the 10s timeout expires
+    // and we return immediately.
+    let result = self
+      .send_cdp_and_wait_for_load(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": js,
+          "returnByValue": true,
+        }),
+        10,
+      )
+      .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+      let msg = exception
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .or_else(|| exception.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Click failed");
+      return Err(McpError {
+        code: -32000,
+        message: msg.to_string(),
+      });
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Clicked element: {selector}")
+      }]
+    }))
+  }
+
+  async fn handle_type_text(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let selector = arguments
+      .get("selector")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing selector".to_string(),
+      })?;
+    let text = arguments
+      .get("text")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing text".to_string(),
+      })?;
+    let clear_first = arguments
+      .get("clear_first")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
+    let instant = arguments
+      .get("instant")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let wpm = arguments.get("wpm").and_then(|v| v.as_f64());
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let selector_escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let focus_js = if clear_first {
+      format!(
+        r#"(() => {{
+          const el = document.querySelector('{}');
+          if (!el) throw new Error('Element not found: {}');
+          el.scrollIntoView({{block: 'center'}});
+          el.focus();
+          el.value = '';
+          el.dispatchEvent(new Event('input', {{bubbles: true}}));
+          return true;
+        }})()"#,
+        selector_escaped, selector_escaped
+      )
+    } else {
+      format!(
+        r#"(() => {{
+          const el = document.querySelector('{}');
+          if (!el) throw new Error('Element not found: {}');
+          el.scrollIntoView({{block: 'center'}});
+          el.focus();
+          return true;
+        }})()"#,
+        selector_escaped, selector_escaped
+      )
+    };
+
+    let focus_result = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": focus_js,
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+
+    if let Some(exception) = focus_result.get("exceptionDetails") {
+      let msg = exception
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .or_else(|| exception.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Focus failed");
+      return Err(McpError {
+        code: -32000,
+        message: msg.to_string(),
+      });
+    }
+
+    if instant {
+      self
+        .send_cdp(
+          &target,
+          "Input.insertText",
+          serde_json::json!({ "text": text }),
+        )
+        .await?;
+    } else {
+      self.send_human_keystrokes(&target, text, wpm).await?;
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Typed text into element: {selector}")
+      }]
+    }))
+  }
+
+  async fn handle_get_page_content(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let format = arguments
+      .get("format")
+      .and_then(|v| v.as_str())
+      .unwrap_or("text");
+    let selector = arguments.get("selector").and_then(|v| v.as_str());
+    let max_chars = arguments
+      .get("max_chars")
+      .and_then(|v| v.as_u64())
+      .map(|n| n as usize)
+      .unwrap_or(40_000);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let js = if let Some(sel) = selector {
+      let sel_escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
+      if format == "html" {
+        format!(
+          r#"(() => {{
+            const el = document.querySelector('{}');
+            return el ? el.outerHTML : null;
+          }})()"#,
+          sel_escaped
+        )
+      } else {
+        format!(
+          r#"(() => {{
+            const el = document.querySelector('{}');
+            return el ? el.innerText : null;
+          }})()"#,
+          sel_escaped
+        )
+      }
+    } else if format == "html" {
+      "document.documentElement.outerHTML".to_string()
+    } else {
+      "document.body.innerText".to_string()
+    };
+
+    let result = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": js,
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+
+    let content = result
+      .get("result")
+      .and_then(|r| r.get("value"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+
+    // Cap output so a 500 KB DOM dump doesn't blow out the agent's context.
+    // Slice on character boundaries (chars().take().collect()) rather than
+    // byte indices, since the latter would panic on multi-byte boundaries.
+    let total_chars = content.chars().count();
+    let (text, truncated) = if total_chars > max_chars {
+      (content.chars().take(max_chars).collect::<String>(), true)
+    } else {
+      (content.to_string(), false)
+    };
+
+    let payload = if truncated {
+      format!(
+        "{text}\n\n[truncated: showing {max_chars} of {total_chars} chars — call with a larger max_chars or use get_interactive_elements for an indexed view]"
+      )
+    } else {
+      text
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": payload
+      }]
+    }))
+  }
+
+  async fn handle_get_page_info(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let result = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": "JSON.stringify({url: location.href, title: document.title, readyState: document.readyState})",
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+
+    let info_str = result
+      .get("result")
+      .and_then(|r| r.get("value"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("{}");
+
+    let info: serde_json::Value = serde_json::from_str(info_str).unwrap_or(serde_json::json!({}));
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&info).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_get_interactive_elements(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let max_chars = arguments
+      .get("max_chars")
+      .and_then(|v| v.as_u64())
+      .map(|n| n as usize)
+      .unwrap_or(40_000);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    // Walk the DOM for visible, non-disabled interactive elements, label them
+    // with a zero-based index, and cache the live references on
+    // `window.__donut_interactive` so click_by_index / type_by_index can
+    // resolve the index → Element without round-tripping a selector.
+    let js = INTERACTIVE_ELEMENTS_JS.replace("__MAX_CHARS__", &max_chars.to_string());
+
+    let result = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": js,
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+      let msg = exception
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .or_else(|| exception.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Enumeration failed");
+      return Err(McpError {
+        code: -32000,
+        message: msg.to_string(),
+      });
+    }
+
+    let payload_str = result
+      .get("result")
+      .and_then(|r| r.get("value"))
+      .and_then(|v| v.as_str())
+      .unwrap_or("{}");
+
+    let payload: serde_json::Value =
+      serde_json::from_str(payload_str).unwrap_or(serde_json::json!({}));
+    let elements = payload
+      .get("elements")
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let count = payload.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let truncated = payload
+      .get("truncated")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+
+    let header = if truncated {
+      format!("{count} interactive elements (truncated at {max_chars} chars — re-call with a larger max_chars or scroll the page):")
+    } else {
+      format!("{count} interactive elements:")
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("{header}\n{elements}")
+      }]
+    }))
+  }
+
+  async fn handle_click_by_index(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let index = arguments
+      .get("index")
+      .and_then(|v| v.as_u64())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing index".to_string(),
+      })?;
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    let js = format!(
+      r#"(() => {{
+        const arr = window.__donut_interactive;
+        if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
+        const el = arr[{index}];
+        el.scrollIntoView({{block: 'center'}});
+        el.click();
+        return true;
+      }})()"#
+    );
+
+    let result = self
+      .send_cdp_and_wait_for_load(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": js,
+          "returnByValue": true,
+        }),
+        10,
+      )
+      .await?;
+
+    if let Some(exception) = result.get("exceptionDetails") {
+      let msg = exception
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .or_else(|| exception.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Click failed");
+      return Err(McpError {
+        code: -32000,
+        message: msg.to_string(),
+      });
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Clicked element at index {index}")
+      }]
+    }))
+  }
+
+  async fn handle_type_by_index(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let index = arguments
+      .get("index")
+      .and_then(|v| v.as_u64())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing index".to_string(),
+      })?;
+    let text = arguments
+      .get("text")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing text".to_string(),
+      })?;
+    let clear_first = arguments
+      .get("clear_first")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
+    let instant = arguments
+      .get("instant")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let wpm = arguments.get("wpm").and_then(|v| v.as_f64());
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+
+    // Mirrors handle_type_text's focus step but resolves the element via the
+    // cached index instead of a CSS selector.
+    let focus_js = if clear_first {
+      format!(
+        r#"(() => {{
+          const arr = window.__donut_interactive;
+          if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
+          const el = arr[{index}];
+          el.scrollIntoView({{block: 'center'}});
+          el.focus();
+          el.value = '';
+          el.dispatchEvent(new Event('input', {{bubbles: true}}));
+          return true;
+        }})()"#
+      )
+    } else {
+      format!(
+        r#"(() => {{
+          const arr = window.__donut_interactive;
+          if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
+          const el = arr[{index}];
+          el.scrollIntoView({{block: 'center'}});
+          el.focus();
+          return true;
+        }})()"#
+      )
+    };
+
+    let focus_result = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": focus_js,
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+
+    if let Some(exception) = focus_result.get("exceptionDetails") {
+      let msg = exception
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .or_else(|| exception.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Focus failed");
+      return Err(McpError {
+        code: -32000,
+        message: msg.to_string(),
+      });
+    }
+
+    if instant {
+      self
+        .send_cdp(
+          &target,
+          "Input.insertText",
+          serde_json::json!({ "text": text }),
+        )
+        .await?;
+    } else {
+      self.send_human_keystrokes(&target, text, wpm).await?;
+    }
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Typed text into element at index {index}")
+      }]
+    }))
+  }
+
+  // --- Synchronizer handlers ---
+
+  async fn handle_start_sync_session(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let leader_id = arguments
+      .get("leader_profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing leader_profile_id".to_string(),
+      })?;
+    let follower_ids: Vec<String> = arguments
+      .get("follower_profile_ids")
+      .and_then(|v| v.as_array())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing follower_profile_ids".to_string(),
+      })?
+      .iter()
+      .filter_map(|v| v.as_str().map(|s| s.to_string()))
+      .collect();
+
+    let app = {
+      let inner = self.inner.lock().await;
+      inner.app_handle.clone().ok_or_else(|| McpError {
+        code: -32000,
+        message: "MCP server not properly initialized".to_string(),
+      })?
+    };
+
+    let info = crate::synchronizer::SynchronizerManager::instance()
+      .start_session(app, leader_id.to_string(), follower_ids)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e,
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&info).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_stop_sync_session(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let session_id = arguments
+      .get("session_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing session_id".to_string(),
+      })?;
+
+    let app = {
+      let inner = self.inner.lock().await;
+      inner.app_handle.clone().ok_or_else(|| McpError {
+        code: -32000,
+        message: "MCP server not properly initialized".to_string(),
+      })?
+    };
+
+    crate::synchronizer::SynchronizerManager::instance()
+      .stop_session(app, session_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e,
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": "Sync session stopped"
+      }]
+    }))
+  }
+
+  async fn handle_get_sync_sessions(&self) -> Result<serde_json::Value, McpError> {
+    let sessions = crate::synchronizer::SynchronizerManager::instance()
+      .get_sessions()
+      .await;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&sessions).unwrap_or_default()
+      }]
+    }))
+  }
+
+  async fn handle_remove_sync_follower(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let session_id = arguments
+      .get("session_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing session_id".to_string(),
+      })?;
+    let follower_id = arguments
+      .get("follower_profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing follower_profile_id".to_string(),
+      })?;
+
+    let app = {
+      let inner = self.inner.lock().await;
+      inner.app_handle.clone().ok_or_else(|| McpError {
+        code: -32000,
+        message: "MCP server not properly initialized".to_string(),
+      })?
+    };
+
+    crate::synchronizer::SynchronizerManager::instance()
+      .remove_follower(app, session_id, follower_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e,
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": "Follower removed from sync session"
+      }]
+    }))
+  }
+
+  // --- Remote fleet and cookie bot -----------------------------------------
+  //
+  // Every tool below is a proxy onto Donut cloud, which owns the schedule, the
+  // calendar arithmetic, the browsing behaviour and the pooled hour budget.
+  // Nothing here decides when a run happens or what it does. What this file
+  // DOES decide is which profiles may be offered to the bot at all.
+
+  /// Render a value as the single text block an MCP tool answers with.
+  fn json_content<T: Serialize>(value: &T) -> Result<serde_json::Value, McpError> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to encode response: {e}"),
+    })?;
+    Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
+  }
+
+  fn require_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Result<&'a str, McpError> {
+    arguments
+      .get(key)
+      .and_then(|value| value.as_str())
+      .filter(|value| !value.is_empty())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: format!("Missing {key}"),
+      })
+  }
+
+  /// Read a whole-number argument, refusing anything that would silently wrap.
+  ///
+  /// `as_u64() as u16` would turn a run time of 1440 into 1440 but 65536 into
+  /// 0, quietly scheduling a run at midnight nobody asked for.
+  fn require_u16(arguments: &serde_json::Value, key: &str) -> Result<u16, McpError> {
+    Self::optional_u16(arguments, key)?.ok_or_else(|| McpError {
+      code: -32602,
+      message: format!("Missing {key}"),
+    })
+  }
+
+  fn optional_u16(arguments: &serde_json::Value, key: &str) -> Result<Option<u16>, McpError> {
+    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
+      return Ok(None);
+    };
+    value
+      .as_u64()
+      .and_then(|raw| u16::try_from(raw).ok())
+      .map(Some)
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: format!("{key} must be a whole number between 0 and 65535"),
+      })
+  }
+
+  fn optional_u8(arguments: &serde_json::Value, key: &str) -> Result<Option<u8>, McpError> {
+    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
+      return Ok(None);
+    };
+    value
+      .as_u64()
+      .and_then(|raw| u8::try_from(raw).ok())
+      .map(Some)
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: format!("{key} must be a whole number between 0 and 255"),
+      })
+  }
+
+  fn optional_u32(arguments: &serde_json::Value, key: &str) -> Result<Option<u32>, McpError> {
+    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
+      return Ok(None);
+    };
+    value
+      .as_u64()
+      .and_then(|raw| u32::try_from(raw).ok())
+      .map(Some)
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: format!("{key} must be a whole number between 0 and 4294967295"),
+      })
+  }
+
+  /// A cloud failure, rendered as the `{"code":…,"params":{…}}` envelope.
+  ///
+  /// The backend's own English would be meaningless to an agent deciding what
+  /// to do next; a stable code and its parameters are something it can branch
+  /// on, and it is the same envelope the desktop and the REST API answer with.
+  fn cloud_error(err: crate::cookie_bot::CookieBotError) -> McpError {
+    McpError {
+      code: -32000,
+      message: err.to_error_json(),
+    }
+  }
+
+  /// Resolve a profile the cookie bot is allowed to touch.
+  ///
+  /// The same gate the REST surface applies, for the same reason: the bot runs
+  /// ONLY on the leased fleet, so a profile that cannot make the round trip to
+  /// a remote host and back — never synced, encrypted with a key that never
+  /// leaves this machine, no recorded OS, an OS the fleet cannot lease, or no
+  /// proxy or VPN to egress through — must never reach an enrolment, a quota
+  /// check or a leased host on ANY surface.
+  fn cookie_bot_eligible_profile(profile_id: &str) -> Result<BrowserProfile, McpError> {
+    let profiles = ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+      })?;
+
+    let profile = profiles
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+      })?;
+
+    crate::cookie_bot::bot_precondition(&profile, &crate::cookie_bot::exit_reachability(&profile))
+      .map_err(|message| McpError {
+        code: -32000,
+        message,
+      })?;
+    Ok(profile)
+  }
+
+  /// Start this profile on a host of its own operating system.
+  ///
+  /// Deliberately no `is_cross_os` guard: local `run_profile` refuses a foreign
+  /// profile because THIS machine is the wrong OS, and running it on a host of
+  /// its own OS is precisely what this exists for.
+  async fn handle_run_profile_remote(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let url = arguments
+      .get("url")
+      .and_then(|v| v.as_str())
+      .map(str::to_string);
+    let profile = self.get_wayfern_profile(profile_id)?;
+
+    // The host pulls the profile from cloud storage, so one that has never
+    // synced would launch an empty browser and push that emptiness back over
+    // the real one. Same rule the REST route applies, from the same place.
+    crate::api_server::remote_launch_precondition(&profile)
+      .await
+      .map_err(|message| McpError {
+        code: -32000,
+        message,
+      })?;
+
+    let app = {
+      let inner = self.inner.lock().await;
+      inner.app_handle.clone().ok_or_else(|| McpError {
+        code: -32000,
+        message: "MCP server not properly initialized".to_string(),
+      })?
+    };
+
+    let outcome = crate::remote_session::start_remote_session(app, &profile, url)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e.to_error_json(),
+      })?;
+    Self::json_content(&outcome)
+  }
+
+  /// Stop a remote session and settle what it cost.
+  async fn handle_stop_remote_session(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let session_id = Self::require_str(arguments, "session_id")?;
+    let outcome = crate::remote_session::end_remote_session(session_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e.to_error_json(),
+      })?;
+    Self::json_content(&outcome)
+  }
+
+  async fn handle_list_remote_sessions() -> Result<serde_json::Value, McpError> {
+    let sessions = crate::remote_session::list_remote_sessions()
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e.to_error_json(),
+      })?;
+    Self::json_content(&sessions)
+  }
+
+  async fn handle_get_remote_session(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let session_id = Self::require_str(arguments, "session_id")?;
+    let state = crate::remote_session::get_remote_session(session_id)
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: e.to_error_json(),
+      })?;
+    Self::json_content(&state)
+  }
+
+  async fn handle_get_remote_hours_quota() -> Result<serde_json::Value, McpError> {
+    let quota = crate::cookie_bot::remote_hours_quota()
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&quota)
+  }
+
+  async fn handle_list_cookie_bot_schedules(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let scope = arguments.get("scope").and_then(|value| value.as_str());
+    let schedules = crate::cookie_bot::list_schedules(scope)
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&schedules)
+  }
+
+  async fn handle_get_cookie_bot_schedule(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    // Not gated on eligibility: a profile whose sync was turned off after it
+    // was enrolled must still be able to show what it is enrolled as.
+    let schedule = crate::cookie_bot::get_schedule(profile_id)
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&schedule)
+  }
+
+  async fn handle_set_cookie_bot_schedule(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let profile = Self::cookie_bot_eligible_profile(profile_id)?;
+
+    // `bot_precondition` already proved the profile has an OS the fleet can
+    // lease. Taking the platform from the profile rather than the arguments is
+    // what stops an agent enrolling a macOS profile onto a Windows host.
+    let platform = profile
+      .resolved_os()
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: "Profile has no recorded operating system".to_string(),
+      })?
+      .to_string();
+
+    if let Some(requested) = arguments.get("platform").and_then(|v| v.as_str()) {
+      if requested != platform {
+        return Err(McpError {
+          code: -32602,
+          message: format!(
+            "platform {requested:?} does not match the profile's own operating system {platform:?}"
+          ),
+        });
+      }
+    }
+
+    let enabled = arguments
+      .get("enabled")
+      .and_then(|value| value.as_bool())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing enabled".to_string(),
+      })?;
+
+    let sites = arguments
+      .get("sites")
+      .and_then(|value| value.as_array())
+      .map(|items| {
+        items
+          .iter()
+          .filter_map(|item| item.as_str().map(str::to_string))
+          .collect::<Vec<_>>()
+      })
+      .unwrap_or_default();
+
+    let input = crate::cookie_bot::CookieBotScheduleInput {
+      profile_name: arguments
+        .get("profile_name")
+        .and_then(|value| value.as_str())
+        .map_or_else(|| profile.name.clone(), str::to_string),
+      platform,
+      enabled,
+      run_at_minute: Self::require_u16(arguments, "run_at_minute")?,
+      days_mask: Self::optional_u8(arguments, "days_mask")?.ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing days_mask".to_string(),
+      })?,
+      timezone: Self::require_str(arguments, "timezone")?.to_string(),
+      preset: Self::require_str(arguments, "preset")?.to_string(),
+      max_minutes: Self::optional_u32(arguments, "max_minutes")?.ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing max_minutes".to_string(),
+      })?,
+      sites,
+      jitter_seconds: Self::optional_u32(arguments, "jitter_seconds")?,
+      ..Default::default()
+    }
+    // Derived from the profile, never from the tool arguments: an agent must not
+    // be able to claim a profile has a proxy when it does not.
+    .with_profile_state(crate::cookie_bot::profile_state(&profile));
+
+    let acknowledge_conflict = arguments
+      .get("acknowledge_conflict")
+      .and_then(|value| value.as_bool())
+      .unwrap_or(false);
+
+    let saved = crate::cookie_bot::save_schedule(profile_id, &input, acknowledge_conflict)
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&saved)
+  }
+
+  async fn handle_delete_cookie_bot_schedule(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    // No eligibility gate: a profile that has since become ineligible is
+    // exactly the one an agent most needs to be able to unenrol.
+    let deleted = crate::cookie_bot::delete_schedule(profile_id)
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&deleted)
+  }
+
+  async fn handle_check_cookie_bot_conflicts(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let conflicts = crate::cookie_bot::check_conflicts(
+      profile_id,
+      Self::optional_u16(arguments, "run_at_minute")?,
+      arguments.get("timezone").and_then(|value| value.as_str()),
+      Self::optional_u8(arguments, "days_mask")?,
+    )
+    .await
+    .map_err(Self::cloud_error)?;
+    Self::json_content(&conflicts)
+  }
+
+  async fn handle_list_cookie_bot_runs(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let runs = crate::cookie_bot::list_runs(
+      arguments.get("profile_id").and_then(|value| value.as_str()),
+      arguments.get("scope").and_then(|value| value.as_str()),
+      Self::optional_u32(arguments, "limit")?,
+      arguments.get("before").and_then(|value| value.as_str()),
+    )
+    .await
+    .map_err(Self::cloud_error)?;
+    Self::json_content(&runs)
+  }
+
+  async fn handle_run_cookie_bot_now(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    Self::cookie_bot_eligible_profile(profile_id)?;
+
+    let started =
+      crate::cookie_bot::run_now(profile_id, Self::optional_u32(arguments, "max_minutes")?)
+        .await
+        .map_err(Self::cloud_error)?;
+    Self::json_content(&started)
+  }
+
+  async fn handle_cancel_cookie_bot_run(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let run_id = Self::require_str(arguments, "run_id")?;
+    let run = crate::cookie_bot::cancel_run(run_id)
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&run)
+  }
+
+  async fn handle_list_cookie_bot_presets() -> Result<serde_json::Value, McpError> {
+    // Ids and a rough duration only. What a preset expands to — the site
+    // ordering, the dwell model, the scroll and click programme — is the
+    // server's, and stays there.
+    let presets = crate::cookie_bot::list_presets()
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&presets)
+  }
+
+  async fn handle_get_cookie_bot_usage(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let usage = crate::cookie_bot::team_usage(arguments.get("period").and_then(|v| v.as_str()))
+      .await
+      .map_err(Self::cloud_error)?;
+    Self::json_content(&usage)
+  }
+}
+
+lazy_static::lazy_static! {
+  static ref MCP_SERVER: McpServer = McpServer::new();
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_mcp_tools_count() {
+    let server = McpServer::new();
+    let tools = server.get_tools();
+
+    // Should have at least 59 tools (39 + 7 browser interaction + 13 remote
+    // fleet and cookie-bot tools)
+    assert!(tools.len() >= 59);
+
+    // Names are the contract an MCP client is written against, so a duplicate
+    // silently shadows one of the two in dispatch and the tool that loses is
+    // simply never reachable.
+    let mut seen = std::collections::HashSet::new();
+    for tool in &tools {
+      assert!(
+        seen.insert(tool.name.as_str()),
+        "duplicate MCP tool name: {}",
+        tool.name
+      );
+    }
+
+    // Check tool names
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    // Profile tools
+    assert!(tool_names.contains(&"list_profiles"));
+    assert!(tool_names.contains(&"get_profile"));
+    assert!(tool_names.contains(&"run_profile"));
+    assert!(tool_names.contains(&"kill_profile"));
+    assert!(tool_names.contains(&"get_profile_status"));
+    // Profile import tools
+    assert!(tool_names.contains(&"detect_browser_profiles"));
+    assert!(tool_names.contains(&"import_browser_profiles"));
+    // Group tools
+    assert!(tool_names.contains(&"list_groups"));
+    assert!(tool_names.contains(&"get_group"));
+    assert!(tool_names.contains(&"create_group"));
+    assert!(tool_names.contains(&"update_group"));
+    assert!(tool_names.contains(&"delete_group"));
+    assert!(tool_names.contains(&"assign_profiles_to_group"));
+    // Proxy tools
+    assert!(tool_names.contains(&"list_proxies"));
+    assert!(tool_names.contains(&"get_proxy"));
+    assert!(tool_names.contains(&"create_proxy"));
+    assert!(tool_names.contains(&"update_proxy"));
+    assert!(tool_names.contains(&"delete_proxy"));
+    // Proxy import/export tools
+    assert!(tool_names.contains(&"export_proxies"));
+    assert!(tool_names.contains(&"import_proxies"));
+    // VPN tools
+    assert!(tool_names.contains(&"import_vpn"));
+    assert!(tool_names.contains(&"list_vpn_configs"));
+    assert!(tool_names.contains(&"delete_vpn"));
+    assert!(tool_names.contains(&"connect_vpn"));
+    assert!(tool_names.contains(&"disconnect_vpn"));
+    assert!(tool_names.contains(&"get_vpn_status"));
+    // Fingerprint tools
+    assert!(tool_names.contains(&"get_profile_fingerprint"));
+    assert!(tool_names.contains(&"update_profile_fingerprint"));
+    assert!(tool_names.contains(&"update_profile_proxy_bypass_rules"));
+    // Extension tools
+    assert!(tool_names.contains(&"list_extensions"));
+    assert!(tool_names.contains(&"list_extension_groups"));
+    assert!(tool_names.contains(&"add_extension"));
+    assert!(tool_names.contains(&"update_extension"));
+    assert!(tool_names.contains(&"create_extension_group"));
+    assert!(tool_names.contains(&"update_extension_group"));
+    assert!(tool_names.contains(&"add_extension_to_group"));
+    assert!(tool_names.contains(&"remove_extension_from_group"));
+    assert!(tool_names.contains(&"delete_extension"));
+    assert!(tool_names.contains(&"delete_extension_group"));
+    assert!(tool_names.contains(&"assign_extension_group_to_profile"));
+    // Cookie tools
+    assert!(tool_names.contains(&"import_profile_cookies"));
+    // Team lock tools
+    assert!(tool_names.contains(&"get_team_locks"));
+    assert!(tool_names.contains(&"get_team_lock_status"));
+    // Synchronizer tools
+    assert!(tool_names.contains(&"start_sync_session"));
+    assert!(tool_names.contains(&"stop_sync_session"));
+    assert!(tool_names.contains(&"get_sync_sessions"));
+    assert!(tool_names.contains(&"remove_sync_follower"));
+    // Browser interaction tools
+    assert!(tool_names.contains(&"navigate"));
+    assert!(tool_names.contains(&"screenshot"));
+    assert!(tool_names.contains(&"evaluate_javascript"));
+    assert!(tool_names.contains(&"click_element"));
+    assert!(tool_names.contains(&"type_text"));
+    assert!(tool_names.contains(&"get_page_content"));
+    assert!(tool_names.contains(&"get_page_info"));
+    // Remote fleet: an agent must be able to start a session, see it become
+    // usable, drive it with the tools above, and stop it. Any one of those
+    // missing makes remote driving unusable from MCP alone.
+    assert!(tool_names.contains(&"run_profile_remote"));
+    assert!(tool_names.contains(&"stop_remote_session"));
+    assert!(tool_names.contains(&"list_remote_sessions"));
+    assert!(tool_names.contains(&"get_remote_session"));
+    assert!(tool_names.contains(&"get_remote_hours_quota"));
+    // Cookie bot
+    assert!(tool_names.contains(&"list_cookie_bot_schedules"));
+    assert!(tool_names.contains(&"get_cookie_bot_schedule"));
+    assert!(tool_names.contains(&"set_cookie_bot_schedule"));
+    assert!(tool_names.contains(&"delete_cookie_bot_schedule"));
+    assert!(tool_names.contains(&"check_cookie_bot_conflicts"));
+    assert!(tool_names.contains(&"list_cookie_bot_runs"));
+    assert!(tool_names.contains(&"run_cookie_bot_now"));
+    assert!(tool_names.contains(&"cancel_cookie_bot_run"));
+    assert!(tool_names.contains(&"list_cookie_bot_presets"));
+    assert!(tool_names.contains(&"get_cookie_bot_usage"));
+  }
+
+  // A tool advertised in tools/list but missing from dispatch answers "Unknown
+  // tool": the client can see it and cannot call it, and nothing else in the
+  // build notices.
+  //
+  // Asserted against the source rather than by dispatching, because half these
+  // tools take no arguments — calling them would reach Donut cloud, and a unit
+  // test that needs the network is a test that gets deleted.
+  #[test]
+  fn every_cookie_bot_tool_is_both_advertised_and_dispatchable() {
+    let server = McpServer::new();
+    let advertised: Vec<String> = server
+      .get_tools()
+      .into_iter()
+      .map(|tool| tool.name)
+      .filter(|name| name.contains("cookie_bot") || name.contains("remote"))
+      .collect();
+
+    let dispatched = include_str!("mcp_server.rs");
+    for name in &advertised {
+      assert!(
+        dispatched.contains(&format!("\"{name}\" =>")),
+        "tool is advertised but has no dispatch arm: {name}"
+      );
+    }
+    assert_eq!(
+      advertised.len(),
+      15,
+      "expected the full remote-fleet and cookie-bot set: {advertised:?}"
+    );
+  }
+
+  // The bot runs ONLY on the leased fleet. A profile that cannot be
+  // materialised on a remote host has no path to a run, and every write tool
+  // resolves its profile through this gate before the cloud is asked, so there
+  // is no argument shape that points the bot at a local-only profile.
+  #[test]
+  fn a_profile_the_bot_could_never_run_is_refused_before_the_cloud_is_asked() {
+    use crate::profile::types::SyncMode;
+
+    let eligible = || BrowserProfile {
+      id: uuid::Uuid::nil(),
+      name: "warm me".to_string(),
+      browser: "wayfern".to_string(),
+      version: "latest".to_string(),
+      sync_mode: SyncMode::Regular,
+      host_os: Some("macos".to_string()),
+      proxy_id: Some("proxy-1".to_string()),
+      ..Default::default()
+    };
+
+    assert!(crate::cookie_bot::bot_precondition(
+      &eligible(),
+      &crate::remote_exit::ExitReachability::Remote
+    )
+    .is_ok());
+
+    let mut local_only = eligible();
+    local_only.sync_mode = SyncMode::Disabled;
+    assert!(
+      crate::cookie_bot::bot_precondition(
+        &local_only,
+        &crate::remote_exit::ExitReachability::Remote
+      )
+      .is_err(),
+      "a profile with no cloud copy has nothing for a host to open"
+    );
+
+    let mut linux = eligible();
+    linux.host_os = Some("linux".to_string());
+    assert!(
+      crate::cookie_bot::bot_precondition(&linux, &crate::remote_exit::ExitReachability::Remote)
+        .is_err(),
+      "the fleet cannot lease a linux host"
+    );
+
+    let mut datacenter_egress = eligible();
+    datacenter_egress.proxy_id = None;
+    datacenter_egress.vpn_id = None;
+    assert!(
+      crate::cookie_bot::bot_precondition(
+        &datacenter_egress,
+        &crate::remote_exit::ExitReachability::None
+      )
+      .is_err(),
+      "hours of traffic from a hosting ASN damages the identity being warmed"
+    );
+  }
+
+  // Enrolment carries only the user's own scalars. A site list, a dwell range
+  // or a step programme appearing in the schema would mean the browsing model
+  // had leaked out of the server and into this AGPL client.
+  #[test]
+  fn the_bot_tools_expose_choices_not_behaviour() {
+    let server = McpServer::new();
+    let tools = server.get_tools();
+
+    let presets = tools
+      .iter()
+      .find(|tool| tool.name == "list_cookie_bot_presets")
+      .expect("list_cookie_bot_presets tool");
+    assert_eq!(
+      presets.input_schema["properties"]
+        .as_object()
+        .map(serde_json::Map::len),
+      Some(0),
+      "a preset is chosen by id; it takes no behaviour parameters"
+    );
+
+    let set = tools
+      .iter()
+      .find(|tool| tool.name == "set_cookie_bot_schedule")
+      .expect("set_cookie_bot_schedule tool");
+    let properties = set.input_schema["properties"]
+      .as_object()
+      .expect("schedule properties");
+    for leaked in [
+      "dwell",
+      "dwell_seconds",
+      "scroll",
+      "clicks",
+      "steps",
+      "actions",
+      "corpus",
+      "user_agent",
+    ] {
+      assert!(
+        !properties.contains_key(leaked),
+        "the browsing model leaked into the tool contract: {leaked}"
+      );
+    }
+
+    // `platform` is accepted but not required: this machine already knows the
+    // profile's operating system, and a supplied one that disagrees is
+    // refused rather than honoured.
+    let required = set.input_schema["required"]
+      .as_array()
+      .expect("required fields");
+    assert!(!required.iter().any(|field| field == "platform"));
+    assert!(required.iter().any(|field| field == "profile_id"));
+    assert!(required.iter().any(|field| field == "preset"));
+  }
+
+  #[test]
+  fn test_mcp_server_initial_state() {
+    let server = McpServer::new();
+    assert!(!server.is_running());
+  }
+
+  #[test]
+  fn proxy_tool_schema_exposes_vless_reality_without_requiring_regular_endpoint_fields() {
+    let server = McpServer::new();
+    let tools = server.get_tools();
+    let create = tools
+      .iter()
+      .find(|tool| tool.name == "create_proxy")
+      .expect("create_proxy tool");
+    let properties = &create.input_schema["properties"];
+    assert!(properties["proxy_type"]["enum"]
+      .as_array()
+      .is_some_and(|values| values.iter().any(|value| value == "vless")));
+    assert!(properties["vless_uri"].is_object());
+
+    let required = create.input_schema["required"]
+      .as_array()
+      .expect("required fields");
+    assert!(required.iter().any(|field| field == "name"));
+    assert!(required.iter().any(|field| field == "proxy_type"));
+    assert!(!required.iter().any(|field| field == "host"));
+    assert!(!required.iter().any(|field| field == "port"));
+  }
+
+  #[test]
+  fn rate_limit_only_classifies_browser_automation_tools() {
+    let request = |method: &str, name: Option<&str>| McpRequest {
+      jsonrpc: "2.0".to_string(),
+      id: Some(serde_json::json!(1)),
+      method: method.to_string(),
+      params: name.map(|name| serde_json::json!({ "name": name, "arguments": {} })),
+    };
+
+    for name in [
+      "run_profile",
+      "kill_profile",
+      "batch_run_profiles",
+      "batch_stop_profiles",
+      "start_sync_session",
+      "navigate",
+      "screenshot",
+      "evaluate_javascript",
+      "click_element",
+      "type_text",
+      "get_page_content",
+      "get_page_info",
+      "get_interactive_elements",
+      "click_by_index",
+      "type_by_index",
+      // Leases a remote host for up to two hours and spends the pooled
+      // remote-hour budget.
+      "run_cookie_bot_now",
+      "run_profile_remote",
+      // Reaches the fleet, like the remote-session stop it mirrors.
+      "cancel_cookie_bot_run",
+      "stop_remote_session",
+    ] {
+      assert!(
+        McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
+        "automation tool was not limited: {name}"
+      );
+    }
+
+    for name in [
+      "list_profiles",
+      // Configuration, not automation: one row in Donut cloud, no hardware
+      // leased. Metering it would throttle an agent enrolling a fleet of
+      // profiles, while the budget that guards the hardware is spent per run.
+      "set_cookie_bot_schedule",
+      "delete_cookie_bot_schedule",
+      "list_cookie_bot_schedules",
+      "get_cookie_bot_schedule",
+      "check_cookie_bot_conflicts",
+      "list_cookie_bot_runs",
+      "list_cookie_bot_presets",
+      "get_cookie_bot_usage",
+      "get_remote_hours_quota",
+      "list_remote_sessions",
+      "get_remote_session",
+    ] {
+      assert!(
+        !McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
+        "free or non-leasing tool was limited: {name}"
+      );
+    }
+
+    assert!(!McpServer::is_automation_tool_call(&request(
+      "tools/list",
+      None
+    )));
+  }
+}

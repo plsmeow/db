@@ -1,0 +1,621 @@
+use clap::{Arg, Command};
+use donutbrowser_lib::proxy_runner::{
+  start_proxy_process_with_profile, stop_all_proxy_processes, stop_proxy_process,
+};
+use donutbrowser_lib::proxy_server::{redacted_upstream, run_proxy_server};
+use donutbrowser_lib::proxy_storage::{build_proxy_url, get_proxy_config};
+use std::process;
+
+fn set_high_priority() {
+  #[cfg(unix)]
+  {
+    unsafe {
+      // Set high priority (negative nice value = higher priority)
+      // -10 is a reasonably high priority without being too aggressive
+      // This may fail without elevated privileges, which is fine
+      let result = libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+      if result == 0 {
+        log::info!("Set process priority to -10 (high priority)");
+      } else {
+        // Try a less aggressive priority if -10 fails
+        let result = libc::setpriority(libc::PRIO_PROCESS, 0, -5);
+        if result == 0 {
+          log::info!("Set process priority to -5 (above normal)");
+        }
+      }
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    // Lower OOM score so this process is less likely to be killed under memory pressure
+    // Valid range is -1000 to 1000, lower = less likely to be killed
+    // -500 is a reasonable value that makes us less likely to be killed
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-500") {
+      log::debug!("Could not set OOM score adjustment: {}", e);
+    } else {
+      log::info!("Set OOM score adjustment to -500");
+    }
+  }
+
+  #[cfg(windows)]
+  {
+    use windows::Win32::System::Threading::{
+      GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+    };
+
+    unsafe {
+      let process = GetCurrentProcess();
+      if SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS).is_ok() {
+        log::info!("Set process priority to ABOVE_NORMAL_PRIORITY_CLASS");
+      } else {
+        log::debug!("Could not set process priority class");
+      }
+    }
+  }
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+  // Initialize logger to write to stderr (which will be redirected to file).
+  //
+  // Default filter is Info — Debug pulls in reqwest/hyper internals which
+  // make the per-worker log unreadable on a busy browser session and obscure
+  // the actual lines we care about (binds, accept errors, upstream failures).
+  // RUST_LOG=debug or RUST_LOG=donut_proxy=trace still works for deep dives.
+  env_logger::Builder::from_default_env()
+    .filter_level(log::LevelFilter::Info)
+    .format_timestamp_millis()
+    .init();
+
+  // Set up panic handler to log panics before process exits
+  std::panic::set_hook(Box::new(|panic_info| {
+    log::error!("PANIC in proxy worker: {:?}", panic_info);
+    if let Some(location) = panic_info.location() {
+      log::error!(
+        "Location: {}:{}:{}",
+        location.file(),
+        location.line(),
+        location.column()
+      );
+    }
+    if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+      log::error!("Message: {}", s);
+    }
+  }));
+
+  let matches = Command::new("donut-proxy")
+    .version(env!("BUILD_VERSION"))
+    .subcommand(
+      Command::new("proxy")
+        .about("Manage proxy servers")
+        .subcommand(
+          Command::new("start")
+            .about("Start a proxy server")
+            .arg(Arg::new("host").long("host").help("Upstream proxy host"))
+            .arg(
+              Arg::new("proxy-port")
+                .long("proxy-port")
+                .value_parser(clap::value_parser!(u16))
+                .help("Upstream proxy port"),
+            )
+            .arg(
+              Arg::new("type")
+                .long("type")
+                .help("Proxy type (http, https, socks4, socks5, ss)"),
+            )
+            .arg(
+              Arg::new("port")
+                .short('p')
+                .long("port")
+                .value_parser(clap::value_parser!(u16))
+                .help("Local port to use (random if not specified)"),
+            )
+            .arg(
+              Arg::new("ignore-certificate")
+                .long("ignore-certificate")
+                .help("Ignore certificate errors for HTTPS proxies"),
+            )
+            .arg(
+              Arg::new("upstream")
+                .short('u')
+                .long("upstream")
+                .help("Upstream proxy URL (protocol://[username:password@]host:port)"),
+            )
+            .arg(
+              Arg::new("profile-id")
+                .long("profile-id")
+                .help("ID of the profile this proxy is associated with"),
+            )
+            .arg(
+              Arg::new("bypass-rules")
+                .long("bypass-rules")
+                .help("JSON array of bypass rules (hostnames, IPs, or regex patterns)"),
+            )
+            .arg(
+              Arg::new("blocklist-file")
+                .long("blocklist-file")
+                .help("Path to DNS blocklist file (one domain per line)"),
+            )
+            .arg(
+              Arg::new("dns-allowlist-mode")
+                .long("dns-allowlist-mode")
+                .num_args(0)
+                .help("Treat --blocklist-file as an allowlist (block all domains not listed)"),
+            )
+            .arg(
+              Arg::new("local-protocol")
+                .long("local-protocol")
+                .help("Protocol served to the browser: http (default) or socks5"),
+            ),
+        )
+        .subcommand(
+          Command::new("stop")
+            .about("Stop a proxy server")
+            .arg(Arg::new("id").long("id").help("Proxy ID to stop"))
+            .arg(
+              Arg::new("upstream")
+                .long("upstream")
+                .help("Stop proxies with this upstream URL"),
+            ),
+        )
+        .subcommand(Command::new("list").about("List all proxy servers")),
+    )
+    .subcommand(
+      Command::new("proxy-worker")
+        .about("Run a proxy worker process (internal use)")
+        .arg(
+          Arg::new("id")
+            .long("id")
+            .required(true)
+            .help("Proxy configuration ID"),
+        )
+        .arg(Arg::new("action").required(true).help("Action (start)")),
+    )
+    .subcommand(
+      Command::new("vpn-worker")
+        .about("Run a VPN worker process (internal use)")
+        .arg(
+          Arg::new("id")
+            .long("id")
+            .required(true)
+            .help("VPN worker configuration ID"),
+        )
+        .arg(
+          Arg::new("port")
+            .long("port")
+            .value_parser(clap::value_parser!(u16))
+            .required(true)
+            .help("Local SOCKS5 port"),
+        )
+        .arg(Arg::new("action").required(true).help("Action (start)"))
+        .arg(
+          Arg::new("config-path")
+            .long("config-path")
+            .help("Direct path to the VPN worker config JSON file"),
+        ),
+    )
+    .subcommand(
+      Command::new("xray-worker")
+        .about("Run an Xray-core worker process (internal use)")
+        .arg(Arg::new("action").required(true).help("Action (start)"))
+        .arg(
+          Arg::new("config-path")
+            .long("config-path")
+            .required(true)
+            .help("Direct path to the Xray worker config JSON file"),
+        ),
+    )
+    .subcommand(
+      Command::new("mcp-bridge")
+        .about("Bridge stdio MCP to a local HTTP MCP server")
+        .arg(
+          Arg::new("url")
+            .required(true)
+            .help("HTTP MCP server URL (e.g. http://127.0.0.1:51080/mcp/TOKEN)"),
+        ),
+    )
+    .get_matches();
+
+  if let Some(proxy_matches) = matches.subcommand_matches("proxy") {
+    if let Some(start_matches) = proxy_matches.subcommand_matches("start") {
+      let mut upstream_url: Option<String> = None;
+
+      // Build upstream URL from individual components if provided
+      if let (Some(host), Some(port), Some(proxy_type)) = (
+        start_matches.get_one::<String>("host"),
+        start_matches.get_one::<u16>("proxy-port"),
+        start_matches.get_one::<String>("type"),
+      ) {
+        let username = std::env::var("DONUT_PROXY_USERNAME").ok();
+        let password = std::env::var("DONUT_PROXY_PASSWORD").ok();
+        upstream_url = Some(build_proxy_url(
+          proxy_type,
+          host,
+          *port,
+          username.as_deref(),
+          password.as_deref(),
+        ));
+      } else if let Some(upstream) = start_matches.get_one::<String>("upstream") {
+        if url::Url::parse(upstream)
+          .is_ok_and(|parsed| !parsed.username().is_empty() || parsed.password().is_some())
+        {
+          eprintln!("Credentialed upstream URLs are not accepted as process arguments");
+          process::exit(2);
+        }
+        upstream_url = Some(upstream.clone());
+      }
+
+      let port = start_matches.get_one::<u16>("port").copied();
+      let profile_id = start_matches.get_one::<String>("profile-id").cloned();
+      let bypass_rules: Vec<String> = start_matches
+        .get_one::<String>("bypass-rules")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+      let blocklist_file = start_matches.get_one::<String>("blocklist-file").cloned();
+      let dns_allowlist_mode = start_matches.get_flag("dns-allowlist-mode");
+      let local_protocol = start_matches.get_one::<String>("local-protocol").cloned();
+
+      match start_proxy_process_with_profile(
+        upstream_url,
+        port,
+        profile_id,
+        bypass_rules,
+        blocklist_file,
+        dns_allowlist_mode,
+        local_protocol,
+      )
+      .await
+      {
+        Ok(config) => {
+          // Output the configuration as JSON for the Rust side to parse
+          // Use println! here because this needs to go to stdout for parsing
+          println!(
+            "{}",
+            serde_json::json!({
+              "id": config.id,
+              "localPort": config.local_port,
+              "localUrl": config.local_url,
+              "upstreamUrl": redacted_upstream(&config.upstream_url),
+            })
+          );
+          process::exit(0);
+        }
+        Err(e) => {
+          eprintln!("Failed to start proxy: {}", e);
+          process::exit(1);
+        }
+      }
+    } else if let Some(stop_matches) = proxy_matches.subcommand_matches("stop") {
+      if let Some(id) = stop_matches.get_one::<String>("id") {
+        match stop_proxy_process(id).await {
+          Ok(success) => {
+            // Use println! here because this needs to go to stdout for parsing
+            println!("{}", serde_json::json!({ "success": success }));
+            process::exit(0);
+          }
+          Err(e) => {
+            eprintln!("Failed to stop proxy: {}", e);
+            process::exit(1);
+          }
+        }
+      } else if let Some(upstream) = stop_matches.get_one::<String>("upstream") {
+        // Find proxies with this upstream URL
+        let configs = donutbrowser_lib::proxy_storage::list_proxy_configs();
+        let matching_configs: Vec<_> = configs
+          .iter()
+          .filter(|config| config.upstream_url == *upstream)
+          .collect();
+
+        if matching_configs.is_empty() {
+          eprintln!("No proxies found for {}", upstream);
+          process::exit(1);
+        }
+
+        for config in matching_configs {
+          let _ = stop_proxy_process(&config.id).await;
+        }
+
+        // Use println! here because this needs to go to stdout for parsing
+        println!("{}", serde_json::json!({ "success": true }));
+        process::exit(0);
+      } else {
+        // Stop all proxies
+        match stop_all_proxy_processes().await {
+          Ok(_) => {
+            // Use println! here because this needs to go to stdout for parsing
+            println!("{}", serde_json::json!({ "success": true }));
+            process::exit(0);
+          }
+          Err(e) => {
+            eprintln!("Failed to stop all proxies: {}", e);
+            process::exit(1);
+          }
+        }
+      }
+    } else if proxy_matches.subcommand_matches("list").is_some() {
+      let configs = donutbrowser_lib::proxy_storage::list_proxy_configs();
+      // Use println! here because this needs to go to stdout for parsing
+      println!("{}", serde_json::to_string(&configs).unwrap());
+      process::exit(0);
+    } else {
+      log::error!("Invalid action. Use 'start', 'stop', or 'list'");
+      process::exit(1);
+    }
+  } else if let Some(worker_matches) = matches.subcommand_matches("proxy-worker") {
+    let id = worker_matches
+      .get_one::<String>("id")
+      .expect("id is required");
+    let action = worker_matches
+      .get_one::<String>("action")
+      .expect("action is required");
+
+    if action == "start" {
+      // Set high priority so this process is killed last under resource pressure
+      set_high_priority();
+
+      log::info!(
+        "Proxy worker starting (pid {}, config id {})",
+        std::process::id(),
+        id
+      );
+
+      // Retry config loading to handle file system race condition on Windows
+      // where the config file may not be immediately visible after being written
+      let config = {
+        let mut attempts = 0;
+        loop {
+          if let Some(config) = get_proxy_config(id) {
+            log::info!(
+              "Found config: id={}, port={:?}, upstream={}",
+              config.id,
+              config.local_port,
+              redacted_upstream(&config.upstream_url)
+            );
+            break config;
+          }
+          attempts += 1;
+          if attempts >= 10 {
+            log::error!(
+              "Proxy configuration {} not found after {} attempts",
+              id,
+              attempts
+            );
+            process::exit(1);
+          }
+          log::debug!("Config {} not found yet, retrying ({}/10)...", id, attempts);
+          std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+      };
+
+      // Run the proxy server - this should never return (infinite loop)
+      log::info!("Starting proxy server for config id: {}", id);
+      if let Err(e) = run_proxy_server(config).await {
+        log::error!("Proxy server failed: {} ({:?})", e, e);
+        process::exit(1);
+      }
+      // This should never be reached - run_proxy_server has an infinite loop
+      log::error!("Proxy server returned unexpectedly (this should never happen)");
+      process::exit(1);
+    } else {
+      log::error!("Invalid action for proxy-worker. Use 'start'");
+      process::exit(1);
+    }
+  } else if let Some(vpn_matches) = matches.subcommand_matches("vpn-worker") {
+    let id = vpn_matches.get_one::<String>("id").expect("id is required");
+    let action = vpn_matches
+      .get_one::<String>("action")
+      .expect("action is required");
+    let port = *vpn_matches
+      .get_one::<u16>("port")
+      .expect("port is required");
+    let config_path = vpn_matches.get_one::<String>("config-path");
+
+    if action == "start" {
+      set_high_priority();
+
+      log::info!("VPN worker starting, config id: {}", id);
+      log::info!("Process PID: {}", std::process::id());
+
+      let config = if let Some(path) = config_path {
+        // Load config directly from the provided path
+        log::info!("Loading VPN worker config from: {}", path);
+        match std::fs::read_to_string(path) {
+          Ok(content) => match serde_json::from_str::<
+            donutbrowser_lib::vpn_worker_storage::VpnWorkerConfig,
+          >(&content)
+          {
+            Ok(config) => {
+              log::info!(
+                "Found VPN worker config: id={}, vpn_type={}, vpn_id={}",
+                config.id,
+                config.vpn_type,
+                config.vpn_id
+              );
+              config
+            }
+            Err(e) => {
+              log::error!("Failed to parse VPN worker config from {}: {}", path, e);
+              process::exit(1);
+            }
+          },
+          Err(e) => {
+            log::error!("Failed to read VPN worker config from {}: {}", path, e);
+            process::exit(1);
+          }
+        }
+      } else {
+        // Fallback: discover config by ID with retries
+        let storage_dir = donutbrowser_lib::proxy_storage::get_storage_dir();
+        log::info!("Looking for VPN worker config in: {:?}", storage_dir);
+        let mut attempts = 0;
+        loop {
+          if let Some(config) = donutbrowser_lib::vpn_worker_storage::get_vpn_worker_config(id) {
+            log::info!(
+              "Found VPN worker config: id={}, vpn_type={}, vpn_id={}",
+              config.id,
+              config.vpn_type,
+              config.vpn_id
+            );
+            break config;
+          }
+          attempts += 1;
+          if attempts >= 50 {
+            log::error!(
+              "VPN worker configuration {} not found after {} attempts in {:?}",
+              id,
+              attempts,
+              storage_dir
+            );
+            process::exit(1);
+          }
+          log::info!(
+            "VPN worker config {} not found yet, retrying ({}/50)...",
+            id,
+            attempts
+          );
+          std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+      };
+
+      // Read the decrypted VPN config from the temp file
+      let vpn_config_data = match std::fs::read_to_string(&config.config_file_path) {
+        Ok(data) => data,
+        Err(e) => {
+          log::error!(
+            "Failed to read VPN config file {}: {}",
+            config.config_file_path,
+            e
+          );
+          process::exit(1);
+        }
+      };
+
+      match config.vpn_type.as_str() {
+        "wireguard" => {
+          let wg_config = match donutbrowser_lib::vpn::parse_wireguard_config(&vpn_config_data) {
+            Ok(c) => c,
+            Err(e) => {
+              log::error!("Failed to parse WireGuard config: {}", e);
+              process::exit(1);
+            }
+          };
+
+          let server =
+            donutbrowser_lib::vpn::socks5_server::WireGuardSocks5Server::new(wg_config, port);
+          if let Err(e) = server
+            .run(id.clone(), config_path.map(std::path::PathBuf::from))
+            .await
+          {
+            log::error!("VPN worker failed: {}", e);
+            process::exit(1);
+          }
+        }
+        other => {
+          log::error!("Unknown VPN type: {}", other);
+          process::exit(1);
+        }
+      }
+    } else {
+      log::error!("Invalid action for vpn-worker. Use 'start'");
+      process::exit(1);
+    }
+  } else if let Some(xray_matches) = matches.subcommand_matches("xray-worker") {
+    let action = xray_matches
+      .get_one::<String>("action")
+      .expect("action is required");
+    let config_path = xray_matches
+      .get_one::<String>("config-path")
+      .expect("config-path is required");
+    if action != "start" {
+      log::error!("Invalid action for xray-worker. Use 'start'");
+      process::exit(1);
+    }
+
+    set_high_priority();
+    if let Err(error) =
+      donutbrowser_lib::xray_worker_runner::run_xray_worker(std::path::Path::new(config_path)).await
+    {
+      log::error!("Xray worker failed: {error}");
+      process::exit(1);
+    }
+  } else if let Some(bridge_matches) = matches.subcommand_matches("mcp-bridge") {
+    let url = bridge_matches
+      .get_one::<String>("url")
+      .expect("url is required")
+      .clone();
+
+    // Suppress debug logging for bridge mode — stderr noise confuses MCP clients
+    log::set_max_level(log::LevelFilter::Warn);
+
+    // stdio↔HTTP MCP bridge: translates stdio JSON-RPC to Streamable HTTP transport
+    let client = reqwest::Client::new();
+    let stdin = tokio::io::stdin();
+    let reader = tokio::io::BufReader::new(stdin);
+    let mut session_id: Option<String> = None;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut lines = reader.lines();
+    let mut stdout = tokio::io::stdout();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+      if line.trim().is_empty() {
+        continue;
+      }
+
+      // Check if this is a notification (no "id" field) to handle 202 responses
+      let is_notification = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .map(|v| v.get("id").is_none() || v["id"].is_null())
+        .unwrap_or(false);
+
+      let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json");
+
+      if let Some(sid) = &session_id {
+        req = req.header("mcp-session-id", sid);
+      }
+
+      match req.body(line).send().await {
+        Ok(resp) => {
+          // Capture session ID from initialize response
+          if let Some(sid) = resp.headers().get("mcp-session-id") {
+            if let Ok(s) = sid.to_str() {
+              session_id = Some(s.to_string());
+            }
+          }
+
+          // Notifications return 202 with no body — don't write anything
+          if is_notification {
+            continue;
+          }
+
+          if let Ok(body) = resp.text().await {
+            if !body.is_empty() {
+              let _ = stdout.write_all(body.as_bytes()).await;
+              let _ = stdout.write_all(b"\n").await;
+              let _ = stdout.flush().await;
+            }
+          }
+        }
+        Err(e) => {
+          if !is_notification {
+            let err = serde_json::json!({
+              "jsonrpc": "2.0",
+              "id": null,
+              "error": {"code": -32000, "message": format!("HTTP error: {e}")},
+            });
+            let _ = stdout.write_all(err.to_string().as_bytes()).await;
+            let _ = stdout.write_all(b"\n").await;
+            let _ = stdout.flush().await;
+          }
+        }
+      }
+    }
+  } else {
+    log::error!("No command specified");
+    process::exit(1);
+  }
+}
