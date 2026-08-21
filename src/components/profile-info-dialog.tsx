@@ -336,7 +336,7 @@ export function ProfileInfoDialog({
   onSetPassword,
   onChangePassword,
   onRemovePassword,
-  crossOsUnlocked = false,
+  crossOsUnlocked = true,
   isRunning = false,
   isDisabled = false,
   isCrossOs = false,
@@ -1041,18 +1041,6 @@ function ProfileInfoLayout({
                 <ClearOnCloseToggle profile={profile} isDisabled={isDisabled} />
               )}
 
-              {profile.created_by_email && (
-                <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                  <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                    {t("sync.team.title")}
-                  </p>
-                  <p className="mt-0.5 text-sm">
-                    {t("sync.team.createdBy", {
-                      email: profile.created_by_email,
-                    })}
-                  </p>
-                </div>
-              )}
             </div>
           )}
 
@@ -1922,19 +1910,6 @@ function FingerprintSectionInline({
     );
   }
 
-  if (!crossOsUnlocked) {
-    return (
-      <div className="flex flex-col items-center gap-3 rounded-lg border p-6 text-center">
-        <LuLock className="size-4 shrink-0 text-muted-foreground" />
-        <h3 className="text-sm font-medium text-foreground">
-          {t("profileInfo.fingerprint.lockedTitle")}
-        </h3>
-        <p className="max-w-[48ch] text-sm text-pretty text-muted-foreground">
-          {t("profileInfo.fingerprint.lockedDescription")}
-        </p>
-      </div>
-    );
-  }
 
   const onWayfernChange = (key: keyof WayfernConfig, value: unknown) => {
     setWayfernConfig((prev) => ({ ...prev, [key]: value }));

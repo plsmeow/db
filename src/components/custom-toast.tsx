@@ -308,8 +308,8 @@ export function UnifiedToast(props: ToastProps) {
               <div className="mt-1">
                 <p className="text-xs text-muted-foreground">
                   {progress.phase === "uploading"
-                    ? t("appUpdate.toast.uploading")
-                    : t("appUpdate.toast.downloading")}{" "}
+                    ? t("toasts.progress.uploading")
+                    : t("toasts.progress.downloading")}{" "}
                   {t("toasts.progress.filesProgress", {
                     completed: progress.completed_files,
                     total: progress.total_files,

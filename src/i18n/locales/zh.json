@@ -166,7 +166,6 @@
       "passwordSaved": "加密密码已设置",
       "passwordMismatch": "密码不匹配",
       "passwordTooShort": "密码必须至少8个字符",
-      "requiresProOrOwner": "配置文件加密仅适用于Pro用户和团队所有者。",
       "validatePassword": "验证",
       "validateDialog": {
         "title": "验证加密密码",
@@ -175,15 +174,6 @@
         "matchToast": "密码正确",
         "mismatchToast": "密码不匹配"
       }
-    },
-    "commercial": {
-      "title": "商业许可",
-      "trialActive": "试用期：剩余 {{days}} 天 {{hours}} 小时",
-      "trialActiveDescription": "试用期内商业使用免费。试用期结束后，所有功能继续正常使用 — 个人使用仍然免费，只有商业使用需要许可证。",
-      "trialExpired": "试用期已过期",
-      "trialExpiredDescription": "个人使用仍然免费。商业使用需要许可证。",
-      "subscriptionActive": "已订阅 — {{plan}} 方案",
-      "subscriptionActiveDescription": "您的 Donut Browser 订阅已激活。在订阅有效期内允许商业使用。"
     },
     "advanced": {
       "title": "高级",
@@ -195,8 +185,6 @@
       "copyLogsSuccess": "日志已复制到剪贴板",
       "copyLogsDescription": "复制经过脱敏的近期日志包（最多 5 MB）。脱敏无法识别所有类型的个人数据，请在分享前检查内容。"
     },
-    "disableAutoUpdates": "禁用应用自动更新",
-    "disableAutoUpdatesDescription": "阻止应用程序自动检查和安装 Donut Browser 更新。浏览器更新不受影响。",
     "keepDecryptedProfilesInRam": "在内存中保留已解密的配置文件",
     "keepDecryptedProfilesInRamDescription": "在启动之间保留密码保护配置文件的已解密内存副本,以便更快地启动。无论如何磁盘上的副本始终保持加密。",
     "privacy": {
@@ -287,7 +275,6 @@
       "stopLeader": "停止此配置文件及其所有跟随者",
       "stopFollower": "正在跟随 {{leaderName}} 的操作",
       "desyncedTooltip": "在 {{url}} 同步失败",
-      "paidFeature": "同步器是付费功能",
       "wayfernOnly": "只有 Wayfern 配置文件可以同步",
       "selectFollowers": "选择跟随者配置文件",
       "selectFollowersDesc": "选择将复制领导者配置文件操作的配置文件。只能选择已停止的 Wayfern 配置文件。",
@@ -324,8 +311,7 @@
       "assignExtensionGroup": "分配扩展分组",
       "copyCookies": "复制 Cookie",
       "runSelected": "运行所选",
-      "stopSelected": "停止所选",
-      "proRequired": "批量运行/停止需要 Pro 套餐"
+      "stopSelected": "停止所选"
     },
     "passwordProtectedBadge": "密码保护",
     "launchHook": {
@@ -652,40 +638,6 @@
       "error": "同步错误"
     },
     "description": "连接到同步服务器以在设备之间同步您的配置文件、代理和分组。",
-    "cloud": {
-      "tabLabel": "云端",
-      "selfHostedTabLabel": "自托管",
-      "email": "电子邮件",
-      "deviceLinkInstructions": "点击\"登录\"以在浏览器中打开登录页面。登录后复制显示的代码并粘贴到下方。",
-      "openLogin": "登录",
-      "linkCodeLabel": "登录代码",
-      "linkCodePlaceholder": "粘贴网站的代码",
-      "signInTitle": "登录",
-      "verifyAndLogin": "验证并登录",
-      "loggingIn": "登录中...",
-      "connected": "已连接",
-      "plan": "套餐",
-      "profiles": "配置文件",
-      "profileUsage": "{{used}} / {{limit}}",
-      "manageAccount": "管理账户",
-      "logout": "退出登录",
-      "logoutConfirm": "您确定要退出登录吗？云同步将会停止。",
-      "loginSuccess": "登录成功！",
-      "logoutSuccess": "已成功退出登录。"
-    },
-    "team": {
-      "title": "团队",
-      "name": "团队名称",
-      "role": "角色",
-      "roleOwner": "所有者",
-      "roleAdmin": "管理员",
-      "roleMember": "成员",
-      "manageOnWeb": "在网页控制台管理团队",
-      "profileLocked": "{{email}} 正在使用中",
-      "profileLockedShort": "使用中",
-      "cannotLaunchLocked": "无法启动 — 配置文件正被 {{email}} 使用",
-      "createdBy": "由 {{email}} 创建"
-    },
     "disabled": "已禁用",
     "toast": {
       "profileSynced": "配置文件 '{{name}}' 同步成功",
@@ -874,8 +826,7 @@
       "selectFile": "选择文件",
       "preview": "找到 {{count}} 个 Cookies",
       "success": "成功导入 {{imported}} 个 Cookies（替换了 {{replaced}} 个）",
-      "error": "导入 Cookies 失败",
-      "proFeature": "导入 Cookies 是 Pro 功能"
+      "error": "导入 Cookies 失败"
     },
     "export": {
       "title": "导出 Cookies",
@@ -1081,7 +1032,6 @@
     "productSub": "产品子版本",
     "brand": "品牌",
     "brandVersion": "品牌版本",
-    "proFeature": "这是 Pro 功能",
     "generateFingerprint": "生成指纹",
     "refreshFingerprint": "刷新指纹",
     "canvasNoiseSeedPlaceholder": "输入用于 canvas 指纹的种子字符串",
@@ -1221,9 +1171,7 @@
       "cannotWhileRunning": "更改密码前请先停止此配置文件。"
     },
     "fingerprint": {
-      "notSupported": "指纹编辑仅适用于 Wayfern 配置文件。",
-      "lockedTitle": "查看和编辑指纹是 Pro 功能",
-      "lockedDescription": "每个配置文件中都会保护你的设备信息。查看和编辑配置文件的指纹需要有效的付费方案。"
+      "notSupported": "指纹编辑仅适用于 Wayfern 配置文件。"
     },
     "syncStatusValue": {
       "waiting": "等待中",
@@ -1246,7 +1194,6 @@
     "extensionsTab": "扩展程序",
     "groupsTab": "分组",
     "managedNotice": "此处管理的扩展程序将在启动时替换配置文件中手动安装的所有扩展程序。",
-    "proRequired": "扩展程序管理是 Pro 功能",
     "empty": "尚未上传任何扩展程序。",
     "noGroups": "尚未创建任何扩展程序组。",
     "createGroup": "创建分组",
@@ -1327,14 +1274,6 @@
       "folderLabel": "文件夹",
       "linkedTooltip": "直接从 {{path}} 加载"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "指纹编辑是 Pro 功能",
-    "cookieCopyLocked": "Cookie 复制是 Pro 功能",
-    "cookieImportLocked": "Cookie 导入是 Pro 功能",
-    "cookieExportLocked": "Cookie 导出是 Pro 功能",
-    "cookieManagementLocked": "Cookie 管理是 Pro 功能"
   },
   "dnsBlocklist": {
     "title": "DNS 拦截列表",
@@ -1617,14 +1556,6 @@
     "acceptFailed": "接受条款失败",
     "tryAgain": "请重试"
   },
-  "commercialTrial": {
-    "title": "商业试用期已过期",
-    "description": "你的 2 周商业试用期已结束。",
-    "body": "如果你将 Donut Browser 用于商业目的,需要购买商业许可证才能继续。你仍然可以免费用于个人用途。",
-    "understandButton": "我明白了",
-    "failed": "保存确认失败",
-    "tryAgain": "请重试"
-  },
   "permissionDialog": {
     "titleMicrophone": "需要麦克风访问权限",
     "titleCamera": "需要摄像头访问权限",
@@ -1731,20 +1662,6 @@
   "dataTableActionBar": {
     "selected": "已选择 {{count}}",
     "clearSelection": "清除选择"
-  },
-  "appUpdate": {
-    "toast": {
-      "updateFailed": "更新 Donut Browser 失败",
-      "restartFailed": "重启失败",
-      "updateReady": "更新就绪，请重启以应用",
-      "manualDownloadRequired": "需要手动下载",
-      "restartNow": "立即重启",
-      "viewRelease": "查看版本",
-      "later": "稍后",
-      "uploading": "上传中",
-      "downloading": "下载中",
-      "startingUpdate": "正在开始更新..."
-    }
   },
   "browserDownload": {
     "toast": {
@@ -1881,8 +1798,6 @@
     "invalidLaunchHookUrl": "启动钩子 URL 无效。请使用完整的 http:// 或 https:// URL。",
     "cookieDbLocked": "无法读取 Cookie — 数据库已锁定。请关闭浏览器后重试。",
     "cookieDbUnavailable": "无法读取 Cookie — Cookie 存储不可用。",
-    "selfHostedRequiresLogout": "在配置自托管服务器之前请先退出 Donut 账户。",
-    "fingerprintRequiresPro": "查看或编辑指纹需要有效的付费方案。所有方案均包含指纹保护。",
     "proxyNotWorking": "所选代理无法使用，因此未创建配置文件。",
     "proxyPaymentRequired": "所选代理需要付费（402），其订阅可能已过期，因此未创建配置文件。",
     "vpnNotWorking": "所选 VPN 无法使用，因此未创建配置文件。",
@@ -1920,42 +1835,7 @@
     "xrayUnavailable": "此系统无法使用 Xray-core。",
     "xrayUnsupportedOs": "VLESS 需要 macOS 12 或更高版本。",
     "xrayStartFailed": "无法启动 Xray-core。",
-    "cloudNotSignedIn": "请先登录你的 Donut Browser 账号再使用此功能。",
-    "cloudUnreachable": "无法连接 Donut Browser 服务器。请检查网络后重试。",
-    "cloudRequestFailed": "请求失败。请稍后再试。",
-    "remoteRateLimited": "请求过于频繁。请稍候再试。",
-    "remoteNoCapacity": "当前没有空闲的远程机器。请几分钟后再试。",
-    "remoteNotEntitled": "你的套餐不包含远程运行。",
-    "remoteInteractiveNotEntitled": "您的套餐中的远程时长仅供 Cookie Bot 使用，不能用于手动远程会话。",
-    "remoteRequiresRemoteExitNode": "此配置文件的代理仅在本机可用（例如 127.0.0.1 或局域网地址）。远程会话在我们的主机上运行，因此需要具有公网地址的代理。",
-    "remoteSessionRefused": "远程机器拒绝了此会话。",
-    "remoteSessionNotFound": "该远程会话已不存在。",
-    "remoteSessionConflict": "此配置文件已在别处打开。",
-    "remoteSyncInProgress": "此配置文件仍在上传到云同步。请等待同步完成后重试。",
-    "remoteHoursExhausted": "本月 {{granted}} 小时远程时长已全部用完（已用 {{used}}）。",
-    "notTeamMember": "你不属于任何团队。",
-    "cookieBotNotEntitled": "你的套餐不包含 Cookie Bot。",
-    "cookieBotNotEnrolled": "此配置文件尚未为 Cookie Bot 配置。",
-    "cookieBotScheduleConflict": "{{email}} 已在 {{time}} 养这个配置文件。",
-    "cookieBotRunInProgress": "此配置文件已有一次运行正在进行。",
-    "cookieBotRunNotFound": "该运行记录已不存在。",
-    "cookieBotInvalidSchedule": "该计划无效。请检查运行时间、日期和时长。",
-    "cookieBotInvalidTimezone": "{{timezone}} 不是服务器可识别的时区。",
-    "cookieBotInvalidPeriod": "该周期无效。请使用类似 2026-08 的月份。",
-    "cookieBotSiteLimit": "请输入 {{min}} 到 {{max}} 个网站，每个都要是完整的 http 或 https 地址。",
-    "cookieBotRequiresCloudSync": "请先为此配置文件开启云同步：远程机器没有其他方式获取它。",
-    "cookieBotEncryptedSyncUnsupported": "此配置文件使用端到端加密同步，远程机器无法解密。请改为常规同步。",
-    "cookieBotUnknownPlatform": "此配置文件没有记录操作系统，无法匹配到机器。",
-    "cookieBotUnsupportedPlatform": "Cookie Bot 无法运行 {{platform}} 配置文件。仅支持 Windows 和 macOS 配置文件。",
-    "cookieBotRequiresExitNode": "请先绑定代理或 VPN。否则运行会从数据中心地址发出，损害配置文件的身份。",
-    "cookieBotRequiresRemoteExitNode": "此配置文件的代理仅在本机可用（例如 127.0.0.1 或局域网地址）。Cookie Bot 在我们的主机上运行，因此需要具有公网地址的代理。",
     "unknownCode": "出现问题: {{code}}",
-    "cookieBotTouchFingerprintUnsupported": "该配置文件声称是触摸设备，机器人无法操作。请使用桌面端指纹。",
-    "profileRunningRemotely": "该配置文件正在远程计算机上运行。请先停止远程会话。",
-    "profileRemoteSyncPending": "远程会话刚刚结束。正在等待其更改下载完成后才能在此打开该配置文件。",
-    "profileLockedByMember": "该配置文件正在被 {{email}} 使用。",
-    "profileLockedElsewhere": "该配置文件正在另一台设备上使用。",
-    "profileLockUnavailable": "无法检查该配置文件是否正在别处使用。请检查网络连接后重试。",
     "fingerprintExitMismatch": "代理出口节点与此配置文件的指纹不匹配。",
     "launchConsentExpired": "该确认已失效。请重新启动。",
     "vpnWorkerStartFailed": "无法启动 VPN 连接：{{detail}}",
@@ -1995,10 +1875,7 @@
       "aboutHint": "版本和应用信息"
     },
     "network": "网络",
-    "integrations": "集成",
-    "account": "账号",
-    "cookieBot": "Cookie Bot",
-    "cookieBotRunning": "Cookie Bot — 正在运行"
+    "integrations": "集成"
   },
   "pageTitle": {
     "proxies": "网络",
@@ -2007,10 +1884,8 @@
     "vpns": "网络",
     "settings": "设置",
     "integrations": "集成",
-    "account": "账户",
     "import": "导入配置文件",
-    "shortcuts": "键盘快捷键",
-    "cookieBot": "Cookie Bot"
+    "shortcuts": "键盘快捷键"
   },
   "encryption": {
     "required": {
@@ -2036,39 +1911,17 @@
     }
   },
   "account": {
-    "refreshed": "账户已刷新",
-    "loggedOut": "已退出",
-    "signedOut": "未登录",
-    "signedOutDescription": "登录以启用云同步、加密配置文件和团队功能。",
-    "plan": "套餐：{{plan}} · {{period}}",
-    "refresh": "刷新",
-    "logout": "退出",
-    "signIn": "登录",
-    "fields": {
-      "plan": "套餐",
-      "status": "状态",
-      "teamRole": "团队角色",
-      "period": "计费周期",
-      "device": "设备"
-    },
     "tabs": {
-      "account": "账户",
-      "selfHosted": "自托管",
-      "teamUsage": "团队用量"
+      "selfHosted": "自托管"
     },
     "selfHosted": {
       "title": "自托管同步服务器",
       "description": "将 Donut 连接到您自己的 donut-sync 服务器，无需使用托管云即可同步配置文件、代理、组和扩展程序。",
-      "disabledWhileLoggedIn": "登录 Donut 账户时无法使用自托管同步。请先退出登录以使用自定义服务器。",
       "connectionStatus": "连接：",
       "statusUnknown": "未测试",
       "testConnection": "测试连接",
       "disconnect": "断开连接"
-    },
-    "deviceOrdinal": "第 {{ordinal}} 台，共 {{count}} 台",
-    "automationPrimaryOnly": "浏览器自动化仅在您的主设备（设备 1）上运行。请在该设备上退出登录，才能在此设备上使用。",
-    "automationActiveHere": "浏览器自动化已在此设备上启用。",
-    "viewTeamUsage": "查看团队用量"
+    }
   },
   "shortcutsPage": {
     "title": "键盘快捷键",
@@ -2100,9 +1953,7 @@
     "goExtensions": "转到扩展程序",
     "goGroups": "转到分组",
     "goIntegrations": "转到集成",
-    "goAccount": "转到账户",
-    "goSettings": "转到设置",
-    "goCookieBot": "Cookie Bot"
+    "goSettings": "转到设置"
   },
   "closeConfirm": {
     "title": "关闭 Donut Browser？",
@@ -2179,21 +2030,7 @@
         "groups": "配置文件分组",
         "cookies": "Cookie 导入与导出"
       }
-    },
-    "license": {
-      "title": "许可",
-      "body": "Donut Browser 是开源软件，可免费使用。",
-      "agree": "我知道了",
-      "personalTitle": "个人使用",
-      "personalDesc": "永久免费。",
-      "commercialTitle": "商业使用",
-      "trialBadge": "2 周免费",
-      "commercialDesc": "在 2 周评估期内免费。之后需要付费方案，这有助于本项目的持续维护与发展。"
     }
-  },
-  "wayfernBlocked": {
-    "title": "浏览器自动化已暂停",
-    "description": "浏览器自动化一次只能在一台设备上运行，目前有另一台已登录的设备正在使用。请在该设备上退出登录，然后重新启动此配置文件。"
   },
   "wayfernConfigDialog": {
     "titleView": "查看指纹设置 - {{name}} ({{browser}})",
@@ -2229,323 +2066,6 @@
     "matchToProxy": "将指纹匹配到代理",
     "matching": "匹配中…",
     "matchSuccess": "指纹已更新以匹配代理。重新启动配置文件以生效。"
-  },
-  "cookieBot": {
-    "title": "Cookie Bot",
-    "description": "在远程机器上通宵养号。",
-    "tabs": {
-      "overview": "概览",
-      "schedule": "计划",
-      "activity": "活动",
-      "team": "团队"
-    },
-    "locked": {
-      "title": "Cookie Bot",
-      "hint": "Cookie Bot 在远程机器上通宵养号，无需开着你的电脑也能保住 Cookie 和历史记录。"
-    },
-    "empty": {
-      "title": "尚未加入任何配置文件",
-      "hint": "选一个配置文件，机器人会在远程机器上通宵养号。你的电脑可以关机。",
-      "cta": "加入一个配置文件"
-    },
-    "tonight": {
-      "label": "今晚",
-      "nextRun": "下次运行 {{time}}",
-      "dueCount_one": "{{count}} 个配置文件待运行",
-      "dueCount_other": "{{count}} 个配置文件待运行",
-      "nothingScheduled": "没有安排"
-    },
-    "lastDay": {
-      "label": "最近 24 小时",
-      "none": "还没有运行记录",
-      "ran_one": "{{count}} 次运行",
-      "ran_other": "{{count}} 次运行",
-      "partial_one": "{{count}} 次部分完成",
-      "partial_other": "{{count}} 次部分完成",
-      "failed_one": "{{count}} 次失败",
-      "failed_other": "{{count}} 次失败"
-    },
-    "chart": {
-      "machineTime": "每晚机器时长",
-      "minutes": "{{minutes}} 分钟"
-    },
-    "hours": {
-      "label": "远程时长",
-      "remaining": "{{total}} 小时中还剩 {{remaining}} 小时",
-      "remainingOf": "/ {{total}} 小时",
-      "used": "{{total}} 小时中已用 {{used}} 小时",
-      "resets": "{{date}} 重置",
-      "exhausted": "远程时长已用完。计划仍然保留，将在下个周期恢复。",
-      "exhaustedOn": "远程时长已用完。计划仍然保留，将于 {{date}} 恢复。",
-      "estimate": "每周约 {{hours}} 小时 · 本周期还剩 {{remaining}} 小时",
-      "estimateOverBudget": "每周约需 {{hours}} 小时，但只剩 {{remaining}} 小时",
-      "estimateOnly": "每周约 {{hours}} 小时"
-    },
-    "enrolled": {
-      "columnProfile": "配置文件",
-      "columnCadence": "频率",
-      "columnTime": "时间",
-      "columnNextRun": "下次运行",
-      "columnLastRun": "上次运行",
-      "enrolProfiles": "加入配置文件",
-      "edit": "编辑计划",
-      "neverRun": "从未",
-      "pausedNoHours": "已暂停 — 时长用尽",
-      "profileMissing": "该配置文件不在这台电脑上。"
-    },
-    "schedule": {
-      "empty": "还没有任何安排。",
-      "quietHours_one": "{{count}} 个空闲小时",
-      "quietHours_other": "{{count}} 个空闲小时",
-      "crowded_one": "{{count}} 个配置文件同时开始",
-      "crowded_other": "{{count}} 个配置文件同时开始",
-      "unenrol": "从 Cookie Bot 移除",
-      "unenrolTitle": "将 {{name}} 从 Cookie Bot 移除？",
-      "unenrolDescription": "今晚起停止养号。以往的运行记录仍保留在“活动”中。",
-      "unenrolled": "已从 Cookie Bot 移除"
-    },
-    "status": {
-      "provisioning": "正在准备机器",
-      "ready": "正在加载配置文件",
-      "warming": "养号中",
-      "finished": "正在收尾",
-      "failed": "失败"
-    },
-    "runStatus": {
-      "pending": "排队中",
-      "running": "运行中",
-      "succeeded": "已完成",
-      "partial": "部分完成",
-      "failed": "失败",
-      "skipped": "已跳过",
-      "cancelled": "已停止"
-    },
-    "running": {
-      "label": "正在运行",
-      "more": "另有 {{count}} 个",
-      "stop": "停止运行",
-      "stopped": "运行已停止"
-    },
-    "live": {
-      "idle": "当前没有任务在运行",
-      "streamOffline": "实时更新已离线",
-      "streamOfflineDetail": "实时更新已离线，正在重新连接。下方的运行记录可能不是最新的。",
-      "unnamedSession": "远程会话",
-      "notStartedYet": "机器尚未报告开始时间。",
-      "sitesProgress": "{{total}} 个网站中的 {{visited}} 个",
-      "sitesUnknown": "尚未报告网站信息",
-      "consentHandled_one": "已处理 {{count}} 个同意提示",
-      "consentHandled_other": "已处理 {{count}} 个同意提示",
-      "consentUnknown": "尚未报告同意提示",
-      "billed": "已计费 {{duration}}",
-      "billedUnknown": "尚未报告计费时长",
-      "chunk": "第 {{index}} 段，共 {{total}} 段"
-    },
-    "history": {
-      "title": "运行记录",
-      "allProfiles": "所有配置文件",
-      "searchPlaceholder": "搜索配置文件…",
-      "filterAll": "全部运行",
-      "filterComplete": "已完成",
-      "filterPartial": "部分完成",
-      "filterFailed": "失败",
-      "columnStarted": "开始",
-      "columnProfile": "配置文件",
-      "columnDuration": "时长",
-      "columnSites": "网站",
-      "columnStatus": "状态",
-      "columnOperator": "操作者",
-      "empty": "还没有运行记录。",
-      "noMatch": "没有符合此筛选条件的运行。",
-      "unknownProfile": "未知配置文件",
-      "outcome": "原因：{{reason}}",
-      "sitesVisited": "{{visited}}/{{total}}",
-      "sitesFailed_one": "{{count}} 个网站无法访问",
-      "sitesFailed_other": "{{count}} 个网站无法访问",
-      "consentHandled_one": "已处理 {{count}} 个同意提示",
-      "consentHandled_other": "已处理 {{count}} 个同意提示",
-      "sitesUnknown": "暂无数据"
-    },
-    "duration": {
-      "hm": "{{hours}} 小时 {{minutes}} 分",
-      "ms": "{{minutes}} 分 {{seconds}} 秒",
-      "s": "{{seconds}} 秒"
-    },
-    "picker": {
-      "title": "加入配置文件",
-      "description": "选择机器人应在夜间养号的配置文件。",
-      "searchPlaceholder": "搜索配置文件…",
-      "noProfiles": "没有匹配的配置文件。",
-      "alreadyEnrolled": "已加入",
-      "continue_one": "继续（{{count}} 个）",
-      "continue_other": "继续（{{count}} 个）"
-    },
-    "enrol": {
-      "titleOne": "加入 {{name}}",
-      "titleCount_one": "加入 {{count}} 个配置文件",
-      "titleCount_other": "加入 {{count}} 个配置文件",
-      "editTitle": "编辑计划",
-      "description": "机器人会在远程机器上打开配置文件，浏览你列出的网站。你的电脑可以关机。",
-      "summaryNightly": "每晚 {{time}} 运行，每次最多 {{minutes}} 分钟。",
-      "summaryWeeknights": "周一至周五 {{time}} 运行，每次最多 {{minutes}} 分钟。",
-      "summaryAlternate": "隔晚 {{time}} 运行，每次最多 {{minutes}} 分钟。",
-      "summaryCustom_one": "每周 {{count}} 晚，于 {{time}} 运行，每次最多 {{minutes}} 分钟。",
-      "summaryCustom_other": "每周 {{count}} 晚，于 {{time}} 运行，每次最多 {{minutes}} 分钟。",
-      "confirm": "今晚起加入",
-      "confirmSome": "今晚加入 {{total}} 个中的 {{eligible}} 个",
-      "fixFirst": "请先解决这些问题",
-      "saving": "正在加入…",
-      "saved": "计划已保存",
-      "enrolled_one": "已加入 {{count}} 个配置文件",
-      "enrolled_other": "已加入 {{count}} 个配置文件",
-      "adjust": "调整计划",
-      "cadenceLabel": "频率",
-      "cadenceNightly": "每晚",
-      "cadenceWeeknights": "工作日夜间",
-      "cadenceAlternate": "隔晚一次",
-      "cadenceCustom_one": "每周 {{count}} 晚",
-      "cadenceCustom_other": "每周 {{count}} 晚",
-      "timeLabel": "开始时间",
-      "timeHint": "按各配置文件指纹所在时区计算。",
-      "maxMinutesLabel": "最长分钟数",
-      "intensityLabel": "深度",
-      "sitesLabel": "网站",
-      "sitesPlaceholder": "每行一个网址",
-      "sitesHint_one": "{{count}} 个网站。只会访问你在这里列出的页面。",
-      "sitesHint_other": "{{count}} 个网站。只会访问你在这里列出的页面。",
-      "sitesTooMany": "最多 {{max}} 个网站。",
-      "presetsUnavailable": "无法加载深度预设。请稍后再试。",
-      "confirmBulkTitle_one": "将 {{count}} 个配置文件加入 Cookie Bot？",
-      "confirmBulkTitle_other": "将 {{count}} 个配置文件加入 Cookie Bot？",
-      "confirmBulkDescription_one": "这会占用共享远程时长预订一次夜间运行。时间和网站将在下一步选择。",
-      "confirmBulkDescription_other": "这会占用共享远程时长预订 {{count}} 次夜间运行。时间和网站将在下一步选择。",
-      "confirmBulkButton_one": "继续（{{count}} 个配置文件）",
-      "confirmBulkButton_other": "继续（{{count}} 个配置文件）",
-      "sitesRequired": "请至少添加一个网站。",
-      "addSitesFirst": "请先添加网站",
-      "presetsMissing": "深度预设不可用",
-      "sourceOwn": "我的列表",
-      "sourceCurated": "精选",
-      "sourceSaved": "已保存",
-      "curatedEmpty": "目前没有可用的精选列表。",
-      "curatedNote": "由我们持续维护的精选列表。每个配置文件都会从中抽取各自的样本，因此不会有两个配置文件浏览同一组网站——这正是让列表本身不会变成特征的原因。地址只保留在我们这边。",
-      "savedEmpty": "还没有保存任何内容。请在“我的列表”中输入列表，然后从那里保存。",
-      "savedNote": "保存计划时会把网站复制到计划中，因此以后编辑列表不会影响已有的计划。",
-      "savedUnavailable": "无法加载你保存的列表。",
-      "saveAsList": "保存为列表",
-      "listNamePlaceholder": "为该列表命名",
-      "listSaved": "已保存列表",
-      "listRenamed": "已重命名列表",
-      "listDeleted": "已删除列表",
-      "listRename": "重命名",
-      "listDeleteConfirm": "删除？",
-      "templateMissing": "该保存的列表已不存在。请另选一个。",
-      "templateNameTaken": "你已经有同名的列表。",
-      "templateNameInvalid": "列表名称不超过 {{max}} 个字符。",
-      "calendarLabel": "运行时间",
-      "daysLabel": "星期",
-      "addSlot": "添加时间",
-      "slotsFull": "最多 {{max}} 个开始时间。",
-      "removeSlot": "移除此时间",
-      "pickListFirst": "请先选择列表",
-      "finishCalendarFirst": "请先完成计划",
-      "duplicateSlot": "有两行的星期和时间相同",
-      "listSites_one": "{{count}} 个网站",
-      "listSites_other": "{{count}} 个网站",
-      "summarySlots_one": "每周运行 {{count}} 次，每次最多 {{minutes}} 分钟。",
-      "summarySlots_other": "每周运行 {{count}} 次，每次最多 {{minutes}} 分钟。",
-      "templateNameInvalidNoMax": "该名称不能用于已保存的列表。"
-    },
-    "preset": {
-      "light": "轻度",
-      "balanced": "标准",
-      "deep": "深度"
-    },
-    "template": {
-      "lowIntentPurchaser": "低购买意向买家",
-      "lowIntentPurchaserHint": "把配置文件定位为对价格敏感的买家：比价、优惠券、返现和二手转卖网站，并通过聚合站点而非直接访问零售商。"
-    },
-    "preflight": {
-      "ineligible_one": "{{count}} 个配置文件无法远程运行",
-      "ineligible_other": "{{count}} 个配置文件无法远程运行",
-      "reasonSync": "同步已关闭",
-      "reasonEncrypted": "端到端加密",
-      "reasonNoFingerprint": "没有记录操作系统",
-      "reasonCrossOs": "为 {{os}} 创建 — 没有匹配的远程机器",
-      "reasonNoExitNode": "没有代理或 VPN",
-      "fixSync": "开启同步",
-      "fixEncrypted": "打开同步设置",
-      "fixProxy": "绑定代理",
-      "fixFailed": "无法应用该修复。",
-      "exitNodeHint": "没有代理或 VPN 时，流量会从机器集群自己的数据中心地址发出。来自托管网络的长时间流量对配置文件身份的损害，比完全不养号还要大。"
-    },
-    "conflict": {
-      "title": "{{email}} 已在 {{time}} 养这个配置文件",
-      "detail": "同一个配置文件上有两份计划会重复消耗时长，并可能在运行中冲突。",
-      "keepTheirs": "使用对方的计划",
-      "replace": "用我的替换",
-      "replaceForbidden": "只有团队所有者或管理员才能更改他人的计划。",
-      "askThem": "复制 {{email}}",
-      "emailCopied": "已复制邮箱",
-      "copyFailed": "无法复制该地址。"
-    },
-    "actionBar": {
-      "enrol": "加入 Cookie Bot",
-      "proRequired": "Cookie Bot 需要付费套餐",
-      "noneEligible": "所选配置文件都无法远程养号"
-    },
-    "actions": {
-      "enrol": "加入 Cookie Bot",
-      "editSchedule": "编辑计划",
-      "runNow": "立即运行",
-      "runStarted": "已开始运行",
-      "viewActivity": "查看活动",
-      "runNotStarted": "运行未开始：{{reason}}"
-    },
-    "state": {
-      "enrolled": "已加入",
-      "notEnrolled": "未加入",
-      "paused": "已暂停",
-      "summary": "{{cadence}} {{time}}",
-      "rowMenu": "{{name}} 的 Cookie Bot 选项",
-      "blocked": "无法运行：{{reason}}"
-    },
-    "team": {
-      "title": "团队用量",
-      "pooled_one": "{{total}} 小时中已用 {{used}} 小时，{{count}} 个席位",
-      "pooled_other": "{{total}} 小时中已用 {{used}} 小时，由 {{count}} 个席位共享",
-      "hours": "{{hours}} 小时",
-      "legendBot": "Cookie Bot",
-      "legendInteractive": "手动使用",
-      "columnMember": "成员",
-      "columnRuns": "运行次数",
-      "columnHours": "时长",
-      "columnShare": "占比",
-      "noActivity": "此期间没有远程会话。",
-      "soloNote": "目前只显示你自己的用量。邀请队友后可按成员查看时长分配。",
-      "runsFailed": "· {{n}} 次失败"
-    },
-    "closeReason": {
-      "stoppedByUser": "已手动停止",
-      "maxDuration": "已达时间上限",
-      "other": "已结束：{{reason}}"
-    },
-    "outcome": {
-      "notEntitled": "当前套餐不包含此功能",
-      "syncDisabled": "该配置文件已关闭云同步",
-      "encryptedSync": "不支持端到端加密同步",
-      "proxyRequired": "未绑定代理或 VPN",
-      "touchFingerprint": "不支持触摸设备指纹",
-      "platformUnsupported": "没有机器可运行该配置文件的系统",
-      "noSites": "没有要访问的网站",
-      "quotaExhausted": "远程时长已用完",
-      "profileLocked": "该配置文件已在别处打开",
-      "noCapacity": "没有空闲机器",
-      "managerError": "机器集群未能启动浏览器",
-      "budgetExceeded": "当晚的时长预算已用完",
-      "cancelledByUser": "已手动停止",
-      "unknown": "未知原因（{{code}}）"
-    }
   },
   "prelaunchGate": {
     "titleBlocked": "启动已阻止",

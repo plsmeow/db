@@ -166,7 +166,6 @@
       "passwordSaved": "暗号化パスワードが設定されました",
       "passwordMismatch": "パスワードが一致しません",
       "passwordTooShort": "パスワードは8文字以上である必要があります",
-      "requiresProOrOwner": "プロファイルの暗号化はProユーザーとチームオーナーのみ利用できます。",
       "validatePassword": "確認",
       "validateDialog": {
         "title": "暗号化パスワードを確認",
@@ -175,15 +174,6 @@
         "matchToast": "パスワードが一致しました",
         "mismatchToast": "パスワードが一致しません"
       }
-    },
-    "commercial": {
-      "title": "商用ライセンス",
-      "trialActive": "トライアル: 残り {{days}} 日 {{hours}} 時間",
-      "trialActiveDescription": "トライアル期間中は商用利用が無料です。期間が終了してもすべての機能はそのまま使用できます — 個人利用は引き続き無料で、商用利用のみライセンスが必要になります。",
-      "trialExpired": "トライアル期限切れ",
-      "trialExpiredDescription": "個人利用は引き続き無料です。商用利用にはライセンスが必要です。",
-      "subscriptionActive": "サブスクリプション中 — {{plan}} プラン",
-      "subscriptionActiveDescription": "Donut Browser のサブスクリプションが有効です。プランの期間中、商用利用がライセンスされます。"
     },
     "advanced": {
       "title": "詳細設定",
@@ -195,8 +185,6 @@
       "copyLogsSuccess": "ログをクリップボードにコピーしました",
       "copyLogsDescription": "最近のログを編集したバンドル（最大 5 MB）をコピーします。編集ではすべての種類の個人データを識別できないため、共有前に内容を確認してください。"
     },
-    "disableAutoUpdates": "アプリの自動更新を無効にする",
-    "disableAutoUpdatesDescription": "Donut Browserの自動更新確認・インストールを無効にします。ブラウザの更新には影響しません。",
     "keepDecryptedProfilesInRam": "復号済みプロファイルをRAMに保持",
     "keepDecryptedProfilesInRamDescription": "起動を高速化するため、パスワード保護されたプロファイルの復号済みコピーをRAMに保持します。ディスク上のコピーは常に暗号化されたままです。",
     "privacy": {
@@ -287,7 +275,6 @@
       "stopLeader": "このプロフィールとすべてのフォロワーを停止",
       "stopFollower": "{{leaderName}}のアクションを追従中",
       "desyncedTooltip": "{{url}}で同期に失敗しました",
-      "paidFeature": "シンクロナイザーは有料機能です",
       "wayfernOnly": "Wayfernプロフィールのみ同期可能です",
       "selectFollowers": "フォロワープロフィールを選択",
       "selectFollowersDesc": "リーダープロフィールのアクションを複製するプロフィールを選択してください。停止中のWayfernプロフィールのみ選択できます。",
@@ -324,8 +311,7 @@
       "assignExtensionGroup": "拡張機能グループを割り当て",
       "copyCookies": "Cookieをコピー",
       "runSelected": "選択を実行",
-      "stopSelected": "選択を停止",
-      "proRequired": "一括実行・停止には Pro プランが必要です"
+      "stopSelected": "選択を停止"
     },
     "passwordProtectedBadge": "パスワード保護",
     "launchHook": {
@@ -652,40 +638,6 @@
       "error": "同期エラー"
     },
     "description": "同期サーバーに接続して、デバイス間でプロファイル、プロキシ、グループを同期します。",
-    "cloud": {
-      "tabLabel": "クラウド",
-      "selfHostedTabLabel": "セルフホスト",
-      "email": "メールアドレス",
-      "deviceLinkInstructions": "「ログイン」をクリックすると、ブラウザでログインページが開きます。サインイン後、表示されたコードをコピーして下に貼り付けてください。",
-      "openLogin": "ログイン",
-      "linkCodeLabel": "ログインコード",
-      "linkCodePlaceholder": "ウェブサイトのコードを貼り付け",
-      "signInTitle": "サインイン",
-      "verifyAndLogin": "認証してログイン",
-      "loggingIn": "ログイン中...",
-      "connected": "接続済み",
-      "plan": "プラン",
-      "profiles": "プロファイル",
-      "profileUsage": "{{used}} / {{limit}}",
-      "manageAccount": "アカウント管理",
-      "logout": "ログアウト",
-      "logoutConfirm": "ログアウトしてもよろしいですか？クラウド同期が停止します。",
-      "loginSuccess": "ログインに成功しました！",
-      "logoutSuccess": "ログアウトしました。"
-    },
-    "team": {
-      "title": "チーム",
-      "name": "チーム名",
-      "role": "役割",
-      "roleOwner": "オーナー",
-      "roleAdmin": "管理者",
-      "roleMember": "メンバー",
-      "manageOnWeb": "Webダッシュボードでチームを管理",
-      "profileLocked": "{{email}} が使用中",
-      "profileLockedShort": "使用中",
-      "cannotLaunchLocked": "起動できません — {{email}} がプロファイルを使用中です",
-      "createdBy": "{{email}} が作成"
-    },
     "disabled": "無効",
     "toast": {
       "profileSynced": "プロファイル '{{name}}' を同期しました",
@@ -874,8 +826,7 @@
       "selectFile": "ファイルを選択",
       "preview": "{{count}}件のCookieが見つかりました",
       "success": "{{imported}}件のCookieをインポートしました（{{replaced}}件を置換）",
-      "error": "Cookieのインポートに失敗しました",
-      "proFeature": "Cookieのインポートはプロ機能です"
+      "error": "Cookieのインポートに失敗しました"
     },
     "export": {
       "title": "Cookieのエクスポート",
@@ -1081,7 +1032,6 @@
     "productSub": "プロダクトサブ",
     "brand": "ブランド",
     "brandVersion": "ブランドバージョン",
-    "proFeature": "これはPro機能です",
     "generateFingerprint": "フィンガープリントを生成",
     "refreshFingerprint": "フィンガープリントを更新",
     "canvasNoiseSeedPlaceholder": "キャンバスフィンガープリント用のシード文字列を入力",
@@ -1221,9 +1171,7 @@
       "cannotWhileRunning": "パスワードを変更する前にプロファイルを停止してください。"
     },
     "fingerprint": {
-      "notSupported": "フィンガープリント編集は Wayfern プロファイルでのみ利用できます。",
-      "lockedTitle": "フィンガープリントの表示と編集は Pro 機能です",
-      "lockedDescription": "デバイス情報はすべてのプロファイルで保護されています。プロファイルのフィンガープリントを表示・編集するには、有効な有料プランが必要です。"
+      "notSupported": "フィンガープリント編集は Wayfern プロファイルでのみ利用できます。"
     },
     "syncStatusValue": {
       "waiting": "待機中",
@@ -1246,7 +1194,6 @@
     "extensionsTab": "拡張機能",
     "groupsTab": "グループ",
     "managedNotice": "ここで管理される拡張機能は、起動時にプロファイルに手動でインストールされた拡張機能を置き換えます。",
-    "proRequired": "拡張機能管理はプロ機能です",
     "empty": "まだ拡張機能がアップロードされていません。",
     "noGroups": "まだ拡張機能グループが作成されていません。",
     "createGroup": "グループを作成",
@@ -1327,14 +1274,6 @@
       "folderLabel": "フォルダ",
       "linkedTooltip": "{{path}} から直接読み込みます"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "フィンガープリント編集はプロ機能です",
-    "cookieCopyLocked": "Cookieのコピーはプロ機能です",
-    "cookieImportLocked": "Cookieのインポートはプロ機能です",
-    "cookieExportLocked": "Cookieのエクスポートはプロ機能です",
-    "cookieManagementLocked": "Cookie管理はプロ機能です"
   },
   "dnsBlocklist": {
     "title": "DNSブロックリスト",
@@ -1617,14 +1556,6 @@
     "acceptFailed": "規約への同意に失敗しました",
     "tryAgain": "もう一度お試しください"
   },
-  "commercialTrial": {
-    "title": "商用試用期間が終了しました",
-    "description": "2 週間の商用試用期間が終了しました。",
-    "body": "商用目的で Donut Browser を使用する場合は、続行するために商用ライセンスを購入する必要があります。個人利用は引き続き無料でお使いいただけます。",
-    "understandButton": "了解しました",
-    "failed": "確認の保存に失敗しました",
-    "tryAgain": "もう一度お試しください"
-  },
   "permissionDialog": {
     "titleMicrophone": "マイクへのアクセスが必要です",
     "titleCamera": "カメラへのアクセスが必要です",
@@ -1731,20 +1662,6 @@
   "dataTableActionBar": {
     "selected": "{{count}} 件選択",
     "clearSelection": "選択を解除"
-  },
-  "appUpdate": {
-    "toast": {
-      "updateFailed": "Donut Browser の更新に失敗しました",
-      "restartFailed": "再起動に失敗しました",
-      "updateReady": "アップデートの準備完了。再起動して適用",
-      "manualDownloadRequired": "手動ダウンロードが必要です",
-      "restartNow": "今すぐ再起動",
-      "viewRelease": "リリースを見る",
-      "later": "後で",
-      "uploading": "アップロード中",
-      "downloading": "ダウンロード中",
-      "startingUpdate": "更新を開始しています..."
-    }
   },
   "browserDownload": {
     "toast": {
@@ -1881,8 +1798,6 @@
     "invalidLaunchHookUrl": "起動フックURLが無効です。完全な http:// または https:// URL を使用してください。",
     "cookieDbLocked": "Cookie を読み取れません — データベースがロックされています。ブラウザを閉じてから再試行してください。",
     "cookieDbUnavailable": "Cookie を読み取れません — Cookie ストアを利用できません。",
-    "selfHostedRequiresLogout": "セルフホストサーバーを設定する前に Donut アカウントからサインアウトしてください。",
-    "fingerprintRequiresPro": "フィンガープリントの表示または編集には有効な有料プランが必要です。保護機能はすべてのプランに含まれています。",
     "proxyNotWorking": "選択したプロキシが機能していないため、プロファイルは作成されませんでした。",
     "proxyPaymentRequired": "選択したプロキシは支払いが必要です（402）。サブスクリプションが期限切れの可能性があります。そのため、プロファイルは作成されませんでした。",
     "vpnNotWorking": "選択したVPNが機能していないため、プロファイルは作成されませんでした。",
@@ -1920,42 +1835,7 @@
     "xrayUnavailable": "このシステムでは Xray-core を利用できません。",
     "xrayUnsupportedOs": "VLESS には macOS 12 以降が必要です。",
     "xrayStartFailed": "Xray-core を起動できませんでした。",
-    "cloudNotSignedIn": "この機能を使うには Donut Browser アカウントにサインインしてください。",
-    "cloudUnreachable": "Donut Browser のサーバーに接続できませんでした。接続を確認してもう一度お試しください。",
-    "cloudRequestFailed": "リクエストに失敗しました。しばらくしてからもう一度お試しください。",
-    "remoteRateLimited": "リクエストが多すぎます。少し待ってからもう一度お試しください。",
-    "remoteNoCapacity": "現在空いているリモートマシンがありません。数分後にもう一度お試しください。",
-    "remoteNotEntitled": "ご利用のプランにはリモート実行が含まれていません。",
-    "remoteInteractiveNotEntitled": "ご利用のプランのリモート時間は Cookie Bot 専用で、手動のリモートセッションには使えません。",
-    "remoteRequiresRemoteExitNode": "このプロファイルのプロキシはこのコンピューター上でのみ有効です（127.0.0.1 やローカルネットワークのアドレスなど）。リモートセッションは当社のホスト上で実行されるため、公開アドレスを持つプロキシが必要です。",
-    "remoteSessionRefused": "リモートマシンがこのセッションを拒否しました。",
-    "remoteSessionNotFound": "そのリモートセッションはすでに存在しません。",
-    "remoteSessionConflict": "このプロファイルはすでに別の場所で開かれています。",
-    "remoteSyncInProgress": "このプロファイルはまだクラウド同期にアップロード中です。同期の完了を待ってからお試しください。",
-    "remoteHoursExhausted": "今月のリモート時間 {{granted}} のうち {{used}} をすべて使い切りました。",
-    "notTeamMember": "どのチームにも所属していません。",
-    "cookieBotNotEntitled": "ご利用のプランには Cookie Bot が含まれていません。",
-    "cookieBotNotEnrolled": "このプロファイルはまだ Cookie Bot 用に設定されていません。",
-    "cookieBotScheduleConflict": "{{email}} がすでにこのプロファイルを {{time}} にウォームアップしています。",
-    "cookieBotRunInProgress": "このプロファイルではすでに実行が進行中です。",
-    "cookieBotRunNotFound": "その実行はすでに存在しません。",
-    "cookieBotInvalidSchedule": "そのスケジュールは無効です。実行時刻、曜日、時間の長さを確認してください。",
-    "cookieBotInvalidTimezone": "{{timezone}} はサーバーが認識できないタイムゾーンです。",
-    "cookieBotInvalidPeriod": "その期間は無効です。2026-08 のような月を指定してください。",
-    "cookieBotSiteLimit": "サイトは {{min}} 件以上 {{max}} 件以下で、それぞれ完全な http または https のアドレスにしてください。",
-    "cookieBotRequiresCloudSync": "先にこのプロファイルのクラウド同期を有効にしてください。リモートマシンが取得する手段が他にありません。",
-    "cookieBotEncryptedSyncUnsupported": "このプロファイルはエンドツーエンド暗号化された同期を使用しており、リモートマシンでは復号できません。通常の同期に切り替えてください。",
-    "cookieBotUnknownPlatform": "このプロファイルには OS が記録されていないため、マシンを割り当てられません。",
-    "cookieBotUnsupportedPlatform": "Cookie Bot は {{platform}} のプロファイルを実行できません。対応しているのは Windows と macOS のプロファイルのみです。",
-    "cookieBotRequiresExitNode": "先にプロキシまたは VPN を設定してください。設定しないと通信がデータセンターのアドレスから出て、プロファイルの信頼性を損ないます。",
-    "cookieBotRequiresRemoteExitNode": "このプロファイルのプロキシはこのコンピューター上でのみ有効です（127.0.0.1 やローカルネットワークのアドレスなど）。Cookie Bot は当社のホスト上で実行されるため、公開アドレスを持つプロキシが必要です。",
     "unknownCode": "エラーが発生しました: {{code}}",
-    "cookieBotTouchFingerprintUnsupported": "このプロファイルはタッチ端末を名乗っており、ボットは操作できません。デスクトップのフィンガープリントをお使いください。",
-    "profileRunningRemotely": "このプロファイルはリモートマシンで実行中です。先にリモートセッションを停止してください。",
-    "profileRemoteSyncPending": "リモートセッションが終了しました。この profile をここで開く前に、変更のダウンロードを待っています。",
-    "profileLockedByMember": "このプロファイルは {{email}} が使用中です。",
-    "profileLockedElsewhere": "このプロファイルは別のデバイスで使用中です。",
-    "profileLockUnavailable": "このプロファイルが他で使用中か確認できませんでした。接続を確認して再試行してください。",
     "fingerprintExitMismatch": "プロキシの出口ノードがこのプロファイルのフィンガープリントと一致しません。",
     "launchConsentExpired": "この確認は無効になりました。もう一度起動してください。",
     "vpnWorkerStartFailed": "VPN接続を開始できませんでした: {{detail}}",
@@ -1995,10 +1875,7 @@
       "aboutHint": "バージョンとアプリ情報"
     },
     "network": "ネットワーク",
-    "integrations": "連携",
-    "account": "アカウント",
-    "cookieBot": "Cookie Bot",
-    "cookieBotRunning": "Cookie Bot — 実行中"
+    "integrations": "連携"
   },
   "pageTitle": {
     "proxies": "ネットワーク",
@@ -2007,10 +1884,8 @@
     "vpns": "ネットワーク",
     "settings": "設定",
     "integrations": "連携",
-    "account": "アカウント",
     "import": "プロファイルをインポート",
-    "shortcuts": "キーボードショートカット",
-    "cookieBot": "Cookie Bot"
+    "shortcuts": "キーボードショートカット"
   },
   "encryption": {
     "required": {
@@ -2036,39 +1911,17 @@
     }
   },
   "account": {
-    "refreshed": "アカウントを更新しました",
-    "loggedOut": "ログアウトしました",
-    "signedOut": "未ログイン",
-    "signedOutDescription": "クラウド同期、暗号化プロファイル、チーム機能を有効にするにはサインインしてください。",
-    "plan": "プラン: {{plan}} · {{period}}",
-    "refresh": "更新",
-    "logout": "サインアウト",
-    "signIn": "サインイン",
-    "fields": {
-      "plan": "プラン",
-      "status": "ステータス",
-      "teamRole": "チームロール",
-      "period": "請求周期",
-      "device": "デバイス"
-    },
     "tabs": {
-      "account": "アカウント",
-      "selfHosted": "セルフホスト",
-      "teamUsage": "チームの使用状況"
+      "selfHosted": "セルフホスト"
     },
     "selfHosted": {
       "title": "セルフホスト同期サーバー",
       "description": "Donut を独自の donut-sync サーバーに接続して、ホスト型クラウドを使わずにプロファイル、プロキシ、グループ、拡張機能を同期します。",
-      "disabledWhileLoggedIn": "Donut アカウントにサインインしている間はセルフホスト同期を利用できません。カスタムサーバーを使うにはサインアウトしてください。",
       "connectionStatus": "接続:",
       "statusUnknown": "未テスト",
       "testConnection": "接続をテスト",
       "disconnect": "切断"
-    },
-    "deviceOrdinal": "{{count}} 台中 {{ordinal}} 台目",
-    "automationPrimaryOnly": "ブラウザの自動化はプライマリデバイス（デバイス1）でのみ実行できます。ここで使用するには、そのデバイスでサインアウトしてください。",
-    "automationActiveHere": "ブラウザの自動化はこのデバイスで有効です。",
-    "viewTeamUsage": "チームの使用状況を表示"
+    }
   },
   "shortcutsPage": {
     "title": "キーボードショートカット",
@@ -2100,9 +1953,7 @@
     "goExtensions": "拡張機能へ移動",
     "goGroups": "グループへ移動",
     "goIntegrations": "統合へ移動",
-    "goAccount": "アカウントへ移動",
-    "goSettings": "設定へ移動",
-    "goCookieBot": "Cookie Bot"
+    "goSettings": "設定へ移動"
   },
   "closeConfirm": {
     "title": "Donut Browser を閉じますか？",
@@ -2179,21 +2030,7 @@
         "groups": "プロファイルグループ",
         "cookies": "Cookieのインポート・エクスポート"
       }
-    },
-    "license": {
-      "title": "ライセンス",
-      "body": "Donut Browser はオープンソースで、無料で利用できます。",
-      "agree": "了解しました",
-      "personalTitle": "個人利用",
-      "personalDesc": "永久に無料です。",
-      "commercialTitle": "商用利用",
-      "trialBadge": "2週間無料",
-      "commercialDesc": "2週間の評価期間は無料です。その後は有料プランが必要で、これによりプロジェクトの維持と発展が支えられます。"
     }
-  },
-  "wayfernBlocked": {
-    "title": "ブラウザの自動化が一時停止しました",
-    "description": "ブラウザの自動化は同時に1台のデバイスでのみ利用できます。現在、サインイン中の別のデバイスが使用しています。そのデバイスからサインアウトして、プロファイルを再起動してください。"
   },
   "wayfernConfigDialog": {
     "titleView": "フィンガープリント設定を表示 - {{name}} ({{browser}})",
@@ -2229,323 +2066,6 @@
     "matchToProxy": "フィンガープリントをプロキシに合わせる",
     "matching": "調整中…",
     "matchSuccess": "フィンガープリントをプロキシに合わせて更新しました。反映するにはプロファイルを再起動してください。"
-  },
-  "cookieBot": {
-    "title": "Cookie Bot",
-    "description": "リモートマシンで夜間にプロファイルをウォームアップします。",
-    "tabs": {
-      "overview": "概要",
-      "schedule": "スケジュール",
-      "activity": "アクティビティ",
-      "team": "チーム"
-    },
-    "locked": {
-      "title": "Cookie Bot",
-      "hint": "Cookie Bot はリモートマシンで夜間にプロファイルをウォームアップするため、お使いのコンピューターを起動していなくても Cookie と履歴が維持されます。"
-    },
-    "empty": {
-      "title": "登録されたプロファイルはありません",
-      "hint": "プロファイルを選ぶと、ボットが夜間にリモートマシンでウォームアップします。お使いのコンピューターは電源を切っていて構いません。",
-      "cta": "プロファイルを登録"
-    },
-    "tonight": {
-      "label": "今夜",
-      "nextRun": "次回の実行 {{time}}",
-      "dueCount_one": "{{count}} 件のプロファイルが予定",
-      "dueCount_other": "{{count}} 件のプロファイルが予定",
-      "nothingScheduled": "予定はありません"
-    },
-    "lastDay": {
-      "label": "過去 24 時間",
-      "none": "実行はまだありません",
-      "ran_one": "{{count}} 件実行",
-      "ran_other": "{{count}} 件実行",
-      "partial_one": "{{count}} 件が部分完了",
-      "partial_other": "{{count}} 件が部分完了",
-      "failed_one": "{{count}} 件が失敗",
-      "failed_other": "{{count}} 件が失敗"
-    },
-    "chart": {
-      "machineTime": "1 晩あたりのマシン時間",
-      "minutes": "{{minutes}} 分"
-    },
-    "hours": {
-      "label": "リモート時間",
-      "remaining": "{{total}} 時間のうち残り {{remaining}} 時間",
-      "remainingOf": "/ {{total}} 時間",
-      "used": "{{total}} 時間のうち {{used}} 時間を使用",
-      "resets": "{{date}} にリセット",
-      "exhausted": "リモート時間を使い切りました。スケジュールは登録されたままで、次のサイクルで再開します。",
-      "exhaustedOn": "リモート時間を使い切りました。スケジュールは登録されたままで、{{date}} に再開します。",
-      "estimate": "週あたり約 {{hours}} 時間 · 今サイクルの残り {{remaining}} 時間",
-      "estimateOverBudget": "週あたり約 {{hours}} 時間が必要ですが、残りは {{remaining}} 時間のみです",
-      "estimateOnly": "週あたり約 {{hours}} 時間"
-    },
-    "enrolled": {
-      "columnProfile": "プロファイル",
-      "columnCadence": "頻度",
-      "columnTime": "時刻",
-      "columnNextRun": "次回の実行",
-      "columnLastRun": "前回の実行",
-      "enrolProfiles": "プロファイルを登録",
-      "edit": "スケジュールを編集",
-      "neverRun": "なし",
-      "pausedNoHours": "一時停止 — 時間切れ",
-      "profileMissing": "そのプロファイルはこのコンピューターにありません。"
-    },
-    "schedule": {
-      "empty": "まだ何も予定されていません。",
-      "quietHours_one": "空き時間 {{count}} 時間",
-      "quietHours_other": "空き時間 {{count}} 時間",
-      "crowded_one": "{{count}} 件のプロファイルが同時に開始",
-      "crowded_other": "{{count}} 件のプロファイルが同時に開始",
-      "unenrol": "Cookie Bot から削除",
-      "unenrolTitle": "{{name}} を Cookie Bot から削除しますか?",
-      "unenrolDescription": "今夜からウォームアップを停止します。過去の実行はアクティビティに残ります。",
-      "unenrolled": "Cookie Bot から削除しました"
-    },
-    "status": {
-      "provisioning": "マシンを準備中",
-      "ready": "プロファイルを読み込み中",
-      "warming": "ウォームアップ中",
-      "finished": "終了処理中",
-      "failed": "失敗"
-    },
-    "runStatus": {
-      "pending": "待機中",
-      "running": "実行中",
-      "succeeded": "完了",
-      "partial": "部分完了",
-      "failed": "失敗",
-      "skipped": "スキップ",
-      "cancelled": "停止"
-    },
-    "running": {
-      "label": "実行中",
-      "more": "他 {{count}} 件",
-      "stop": "実行を停止",
-      "stopped": "実行を停止しました"
-    },
-    "live": {
-      "idle": "現在実行中のものはありません",
-      "streamOffline": "ライブ更新はオフラインです",
-      "streamOfflineDetail": "ライブ更新はオフラインです。再接続しています。以下の実行は古い可能性があります。",
-      "unnamedSession": "リモートセッション",
-      "notStartedYet": "マシンから開始時刻がまだ報告されていません。",
-      "sitesProgress": "{{total}} サイト中 {{visited}} サイト",
-      "sitesUnknown": "サイトはまだ報告されていません",
-      "consentHandled_one": "同意ダイアログを {{count}} 件処理",
-      "consentHandled_other": "同意ダイアログを {{count}} 件処理",
-      "consentUnknown": "同意ダイアログはまだ報告されていません",
-      "billed": "{{duration}} を課金",
-      "billedUnknown": "課金時間はまだ報告されていません",
-      "chunk": "{{total}} 分割中 {{index}} 番目"
-    },
-    "history": {
-      "title": "実行履歴",
-      "allProfiles": "すべてのプロファイル",
-      "searchPlaceholder": "プロファイルを検索…",
-      "filterAll": "すべての実行",
-      "filterComplete": "完了",
-      "filterPartial": "部分完了",
-      "filterFailed": "失敗",
-      "columnStarted": "開始",
-      "columnProfile": "プロファイル",
-      "columnDuration": "所要時間",
-      "columnSites": "サイト",
-      "columnStatus": "ステータス",
-      "columnOperator": "実行者",
-      "empty": "実行はまだありません。",
-      "noMatch": "このフィルターに一致する実行はありません。",
-      "unknownProfile": "不明なプロファイル",
-      "outcome": "理由: {{reason}}",
-      "sitesVisited": "{{visited}}/{{total}}",
-      "sitesFailed_one": "{{count}} サイトに接続できませんでした",
-      "sitesFailed_other": "{{count}} サイトに接続できませんでした",
-      "consentHandled_one": "同意ダイアログを {{count}} 件処理",
-      "consentHandled_other": "同意ダイアログを {{count}} 件処理",
-      "sitesUnknown": "未報告"
-    },
-    "duration": {
-      "hm": "{{hours}} 時間 {{minutes}} 分",
-      "ms": "{{minutes}} 分 {{seconds}} 秒",
-      "s": "{{seconds}} 秒"
-    },
-    "picker": {
-      "title": "プロファイルを登録",
-      "description": "ボットが夜間にウォームアップするプロファイルを選びます。",
-      "searchPlaceholder": "プロファイルを検索…",
-      "noProfiles": "一致するプロファイルはありません。",
-      "alreadyEnrolled": "登録済み",
-      "continue_one": "{{count}} 件で続行",
-      "continue_other": "{{count}} 件で続行"
-    },
-    "enrol": {
-      "titleOne": "{{name}} を登録",
-      "titleCount_one": "{{count}} 件のプロファイルを登録",
-      "titleCount_other": "{{count}} 件のプロファイルを登録",
-      "editTitle": "スケジュールを編集",
-      "description": "ボットはリモートマシンでプロファイルを開き、指定したサイトを閲覧します。お使いのコンピューターは電源を切っていて構いません。",
-      "summaryNightly": "毎晩 {{time}} に、1 回あたり最大 {{minutes}} 分実行します。",
-      "summaryWeeknights": "月曜から金曜の {{time}} に、1 回あたり最大 {{minutes}} 分実行します。",
-      "summaryAlternate": "1 晩おきに {{time}} に、1 回あたり最大 {{minutes}} 分実行します。",
-      "summaryCustom_one": "週 {{count}} 晩、{{time}} に、1 回あたり最大 {{minutes}} 分実行します。",
-      "summaryCustom_other": "週 {{count}} 晩、{{time}} に、1 回あたり最大 {{minutes}} 分実行します。",
-      "confirm": "今夜から登録",
-      "confirmSome": "今夜は {{total}} 件中 {{eligible}} 件を登録",
-      "fixFirst": "先にこちらを解決してください",
-      "saving": "登録中…",
-      "saved": "スケジュールを保存しました",
-      "enrolled_one": "{{count}} 件のプロファイルを登録しました",
-      "enrolled_other": "{{count}} 件のプロファイルを登録しました",
-      "adjust": "スケジュールを調整",
-      "cadenceLabel": "頻度",
-      "cadenceNightly": "毎晩",
-      "cadenceWeeknights": "平日の夜",
-      "cadenceAlternate": "1 晩おき",
-      "cadenceCustom_one": "週 {{count}} 晩",
-      "cadenceCustom_other": "週 {{count}} 晩",
-      "timeLabel": "開始時刻",
-      "timeHint": "各プロファイルのフィンガープリントのタイムゾーン基準です。",
-      "maxMinutesLabel": "最大分数",
-      "intensityLabel": "深さ",
-      "sitesLabel": "サイト",
-      "sitesPlaceholder": "1 行に 1 つのアドレス",
-      "sitesHint_one": "{{count}} サイト。ここに記載したページのみ閲覧します。",
-      "sitesHint_other": "{{count}} サイト。ここに記載したページのみ閲覧します。",
-      "sitesTooMany": "サイトは最大 {{max}} 件までです。",
-      "presetsUnavailable": "深さのプリセットを読み込めませんでした。しばらくしてからもう一度お試しください。",
-      "confirmBulkTitle_one": "{{count}} 件のプロファイルを Cookie Bot に登録しますか?",
-      "confirmBulkTitle_other": "{{count}} 件のプロファイルを Cookie Bot に登録しますか?",
-      "confirmBulkDescription_one": "共有のリモート時間から夜間の実行を 1 件予約します。時刻とサイトは次の画面で選びます。",
-      "confirmBulkDescription_other": "共有のリモート時間から夜間の実行を {{count}} 件予約します。時刻とサイトは次の画面で選びます。",
-      "confirmBulkButton_one": "{{count}} 件のプロファイルで続行",
-      "confirmBulkButton_other": "{{count}} 件のプロファイルで続行",
-      "sitesRequired": "サイトを 1 件以上追加してください。",
-      "addSitesFirst": "先にサイトを追加してください",
-      "presetsMissing": "深さのプリセットを利用できません",
-      "sourceOwn": "自分のリスト",
-      "sourceCurated": "厳選リスト",
-      "sourceSaved": "保存済み",
-      "curatedEmpty": "現在利用できる厳選リストはありません。",
-      "curatedNote": "こちらで最新に保っている厳選リストです。プロファイルごとに異なるサンプルを抽出するため、同じ組み合わせを閲覧するプロファイルは 2 つとありません。これがリスト自体を特徴にさせない仕組みです。アドレスはサーバー側に留まります。",
-      "savedEmpty": "まだ保存されていません。「自分のリスト」でリストを入力し、そこから保存してください。",
-      "savedNote": "サイトは保存時にスケジュールへコピーされます。後からリストを編集しても既存のスケジュールは変わりません。",
-      "savedUnavailable": "保存済みのリストを読み込めませんでした。",
-      "saveAsList": "リストとして保存",
-      "listNamePlaceholder": "リスト名を入力",
-      "listSaved": "リストを保存しました",
-      "listRenamed": "リスト名を変更しました",
-      "listDeleted": "リストを削除しました",
-      "listRename": "名前を変更",
-      "listDeleteConfirm": "削除しますか？",
-      "templateMissing": "その保存済みリストは存在しません。別のものを選んでください。",
-      "templateNameTaken": "同じ名前のリストがすでにあります。",
-      "templateNameInvalid": "リスト名は {{max}} 文字以内にしてください。",
-      "calendarLabel": "実行するタイミング",
-      "daysLabel": "曜日",
-      "addSlot": "時刻を追加",
-      "slotsFull": "開始時刻は最大 {{max}} 件です。",
-      "removeSlot": "この時刻を削除",
-      "pickListFirst": "先にリストを選択",
-      "finishCalendarFirst": "先にスケジュールを完成させてください",
-      "duplicateSlot": "2 つの行の曜日と時刻が同じです",
-      "listSites_one": "{{count}} サイト",
-      "listSites_other": "{{count}} サイト",
-      "summarySlots_one": "週 {{count}} 回、1 回あたり最大 {{minutes}} 分実行します。",
-      "summarySlots_other": "週 {{count}} 回、1 回あたり最大 {{minutes}} 分実行します。",
-      "templateNameInvalidNoMax": "その名前は保存済みリストには使用できません。"
-    },
-    "preset": {
-      "light": "軽め",
-      "balanced": "標準",
-      "deep": "深め"
-    },
-    "template": {
-      "lowIntentPurchaser": "低購買意欲の買い物客",
-      "lowIntentPurchaserHint": "価格に敏感な買い手としてプロファイルを位置づけます。比較・クーポン・キャッシュバック・リセールのサイトを巡り、直接ではなく集約サイト経由で小売サイトに到達します。"
-    },
-    "preflight": {
-      "ineligible_one": "{{count}} 件のプロファイルはリモートで実行できません",
-      "ineligible_other": "{{count}} 件のプロファイルはリモートで実行できません",
-      "reasonSync": "同期がオフです",
-      "reasonEncrypted": "エンドツーエンド暗号化",
-      "reasonNoFingerprint": "記録された OS がありません",
-      "reasonCrossOs": "{{os}} 向け — 一致するリモートマシンがありません",
-      "reasonNoExitNode": "プロキシも VPN もありません",
-      "fixSync": "同期をオンにする",
-      "fixEncrypted": "同期設定を開く",
-      "fixProxy": "プロキシを割り当てる",
-      "fixFailed": "その修正を適用できませんでした。",
-      "exitNodeHint": "プロキシも VPN もない場合、通信はマシン群自身のデータセンターのアドレスから出ていきます。ホスティングネットワークからの長時間のトラフィックは、ウォームアップしない場合よりもプロファイルの信頼性を損ないます。"
-    },
-    "conflict": {
-      "title": "{{email}} がすでにこのプロファイルを {{time}} にウォームアップしています",
-      "detail": "1 つのプロファイルに 2 つのスケジュールがあると時間が二重に消費され、実行中に衝突する可能性があります。",
-      "keepTheirs": "相手のスケジュールを使う",
-      "replace": "自分のもので置き換える",
-      "replaceForbidden": "他の人のスケジュールを変更できるのはチームのオーナーまたは管理者のみです。",
-      "askThem": "{{email}} をコピー",
-      "emailCopied": "メールアドレスをコピーしました",
-      "copyFailed": "アドレスをコピーできませんでした。"
-    },
-    "actionBar": {
-      "enrol": "Cookie Bot に登録",
-      "proRequired": "Cookie Bot には有料プランが必要です",
-      "noneEligible": "選択したプロファイルはいずれもリモートでウォームアップできません"
-    },
-    "actions": {
-      "enrol": "Cookie Bot に登録",
-      "editSchedule": "スケジュールを編集",
-      "runNow": "今すぐ実行",
-      "runStarted": "実行を開始しました",
-      "viewActivity": "アクティビティを表示",
-      "runNotStarted": "実行を開始できませんでした: {{reason}}"
-    },
-    "state": {
-      "enrolled": "登録済み",
-      "notEnrolled": "未登録",
-      "paused": "一時停止",
-      "summary": "{{cadence}} {{time}}",
-      "rowMenu": "{{name}} の Cookie Bot オプション",
-      "blocked": "実行できません: {{reason}}"
-    },
-    "team": {
-      "title": "チームの使用状況",
-      "pooled_one": "{{total}} 時間中 {{used}} 時間、{{count}} シート",
-      "pooled_other": "{{total}} 時間中 {{used}} 時間を {{count}} シートで共有",
-      "hours": "{{hours}} 時間",
-      "legendBot": "Cookie Bot",
-      "legendInteractive": "対話操作",
-      "columnMember": "メンバー",
-      "columnRuns": "実行回数",
-      "columnHours": "時間",
-      "columnShare": "割合",
-      "noActivity": "この期間にリモートセッションはありません。",
-      "soloNote": "今のところ表示されるのはご自身の使用状況のみです。メンバーごとの内訳を見るにはチームメイトを招待してください。",
-      "runsFailed": "・失敗 {{n}} 件"
-    },
-    "closeReason": {
-      "stoppedByUser": "手動で停止しました",
-      "maxDuration": "時間の上限に達しました",
-      "other": "終了: {{reason}}"
-    },
-    "outcome": {
-      "notEntitled": "現在のプランには含まれていません",
-      "syncDisabled": "このプロファイルはクラウド同期がオフです",
-      "encryptedSync": "エンドツーエンド暗号化された同期には対応していません",
-      "proxyRequired": "プロキシまたは VPN が設定されていません",
-      "touchFingerprint": "タッチ端末のフィンガープリントには対応していません",
-      "platformUnsupported": "このプロファイルの OS を実行できるマシンがありません",
-      "noSites": "訪問するサイトがありません",
-      "quotaExhausted": "リモート時間を使い切りました",
-      "profileLocked": "プロファイルが別の場所で開かれていました",
-      "noCapacity": "空きマシンがありませんでした",
-      "managerError": "フリートがブラウザーを起動できませんでした",
-      "budgetExceeded": "その晩の持ち時間を使い切りました",
-      "cancelledByUser": "手動で停止しました",
-      "unknown": "不明な理由 ({{code}})"
-    }
   },
   "prelaunchGate": {
     "titleBlocked": "起動をブロックしました",

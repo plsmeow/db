@@ -54,10 +54,8 @@ fn e2e_automation_profile_dir() -> Option<std::path::PathBuf> {
 
 mod api_client;
 mod api_server;
-mod app_auto_updater;
 pub mod app_dirs;
 mod auto_updater;
-mod automation_rate_limiter;
 mod browser;
 mod browser_runner;
 mod browser_version_manager;
@@ -87,9 +85,6 @@ mod proxy_manager;
 pub mod proxy_runner;
 pub mod proxy_server;
 pub mod proxy_storage;
-mod remote_exit;
-mod remote_handoff;
-mod remote_session;
 mod settings_manager;
 pub mod socks5_local;
 pub mod sync;
@@ -99,16 +94,11 @@ mod wayfern_manager;
 mod wayfern_terms;
 mod window_decorations;
 // mod theme_detector; // removed: theme detection handled in webview via CSS prefers-color-scheme
-pub mod cloud_auth;
-mod cloud_errors;
-mod commercial_license;
-mod cookie_bot;
 mod cookie_manager;
 pub mod events;
 mod mcp_integrations;
 mod mcp_server;
 mod tag_manager;
-mod team_lock;
 mod version_updater;
 pub mod vpn;
 mod vpn_extension_detect;
@@ -175,11 +165,6 @@ use version_updater::{
 
 use auto_updater::{
   check_for_browser_updates, complete_browser_update_with_auto_update, dismiss_update_notification,
-};
-
-use app_auto_updater::{
-  check_for_app_updates, check_for_app_updates_manual, download_and_prepare_app_update,
-  restart_application,
 };
 
 use profile_importer::{
@@ -522,27 +507,6 @@ async fn accept_wayfern_terms() -> Result<(), String> {
   wayfern_terms::WayfernTermsManager::instance()
     .accept_terms()
     .await
-}
-
-#[tauri::command]
-async fn get_commercial_trial_status(
-  app_handle: tauri::AppHandle,
-) -> Result<commercial_license::TrialStatus, String> {
-  commercial_license::CommercialLicenseManager::instance()
-    .get_trial_status(&app_handle)
-    .await
-}
-
-#[tauri::command]
-async fn acknowledge_trial_expiration(app_handle: tauri::AppHandle) -> Result<(), String> {
-  commercial_license::CommercialLicenseManager::instance()
-    .acknowledge_expiration(&app_handle)
-    .await
-}
-
-#[tauri::command]
-fn has_acknowledged_trial_expiration(app_handle: tauri::AppHandle) -> Result<bool, String> {
-  commercial_license::CommercialLicenseManager::instance().has_acknowledged(&app_handle)
 }
 
 #[tauri::command]
@@ -1318,264 +1282,6 @@ async fn generate_sample_fingerprint(
   }
 }
 
-// --- Remote sessions --------------------------------------------------------
-//
-// Everything below is transport only. The session state machine, the fleet, the
-// schedule, the browsing behaviour and the budget all live behind
-// donutbrowser-infra; these commands carry the user's own scalars there and
-// render back what the server says.
-
-/// Turn a remote-session failure into the code the frontend translates.
-///
-/// The typed variants carry the backend's own English, which reaches the user
-/// untranslated if it is surfaced as-is. The raw text is kept in the app log,
-/// where support can read it, and never in the toast.
-fn remote_session_error(context: &str, err: remote_session::RemoteSessionError) -> String {
-  log::warn!("Remote session {context} failed: {err}");
-  err.to_error_json()
-}
-
-/// Every remote session the signed-in user currently owns.
-#[tauri::command]
-async fn list_remote_sessions() -> Result<Vec<remote_session::RemoteSessionState>, String> {
-  remote_session::list_remote_sessions()
-    .await
-    .map_err(|e| remote_session_error("list", e))
-}
-
-/// One session's real state.
-///
-/// The stream is how the desktop normally learns a transition; this is the
-/// one-shot read for a window opened after the fact, or a reconnect confirming
-/// what it missed.
-#[tauri::command]
-async fn get_remote_session(
-  session_id: String,
-) -> Result<remote_session::RemoteSessionState, String> {
-  remote_session::get_remote_session(&session_id)
-    .await
-    .map_err(|e| remote_session_error("read", e))
-}
-
-/// Stop a remote session and settle what it cost.
-///
-/// Without this the only thing that ends a session is the fleet's two-hour cap,
-/// so a handful of short launches bills an allowance meant for a hundred.
-#[tauri::command]
-async fn stop_remote_session(
-  app_handle: tauri::AppHandle,
-  session_id: String,
-) -> Result<remote_session::EndRemoteSessionOutcome, String> {
-  let outcome = remote_session::end_remote_session(&session_id)
-    .await
-    .map_err(|e| remote_session_error("stop", e))?;
-  // The stream normally reports the close, but a stop must not depend on a
-  // socket being up: without this the session's work would sit in cloud storage
-  // with nothing to pull it, and the profile would look ready to open locally
-  // while its local copy still predated the session.
-  remote_session::note_session_stopped(&app_handle, &session_id);
-  Ok(outcome)
-}
-
-/// Which profiles cannot be launched locally right now, and why.
-///
-/// Backed by the same store the launch gate reads, so the button the UI disables
-/// and the refusal the backend would produce can never disagree.
-#[tauri::command]
-fn get_remote_handoff_states() -> std::collections::HashMap<String, remote_handoff::HandoffState> {
-  remote_handoff::states()
-}
-
-/// Subscribe to session transitions. Idempotent.
-///
-/// Called once the desktop has a cloud session: signed out there is nothing to
-/// stream and the socket would only be refused on a loop.
-#[tauri::command]
-fn start_remote_session_events(app_handle: tauri::AppHandle) {
-  remote_session::start_session_events(app_handle);
-}
-
-/// Unsubscribe. Safe when nothing is running; called on sign-out.
-#[tauri::command]
-fn stop_remote_session_events() {
-  remote_session::stop_session_events();
-}
-
-/// Whether the desktop is subscribed to session transitions.
-///
-/// A UI that mounts after the stream started has no `remote-session-stream`
-/// event to read, so this is how it decides whether to trust the live state or
-/// fall back to `list_remote_sessions`.
-#[tauri::command]
-fn get_remote_session_events_status() -> bool {
-  remote_session::session_events_running()
-}
-
-// --- Cookie bot -------------------------------------------------------------
-
-/// Turn a cookie-bot failure into the code the frontend translates.
-fn cookie_bot_error(context: &str, err: cookie_bot::CookieBotError) -> String {
-  log::warn!(
-    "Cookie bot {context} failed: {} (HTTP {})",
-    err.code(),
-    err.status()
-  );
-  err.to_error_json()
-}
-
-/// The local profile a cookie-bot write refers to.
-///
-/// Enrolment and run-now act on a profile this machine holds: the client-side
-/// preconditions read its sync mode, OS and exit node, and none of that can be
-/// checked for a profile that is not here.
-fn cookie_bot_profile(profile_id: &str) -> Result<profile::BrowserProfile, String> {
-  let profiles = profile::manager::ProfileManager::instance()
-    .list_profiles()
-    .map_err(|e| wrap_backend_error(e, "Failed to read profiles"))?;
-  profiles
-    .into_iter()
-    .find(|p| p.id.to_string() == profile_id)
-    .ok_or_else(|| backend_error("PROFILE_NOT_FOUND"))
-}
-
-/// Every enrolment the caller can see. `scope` is `mine` or `team`.
-#[tauri::command]
-async fn get_cookie_bot_schedules(
-  scope: Option<String>,
-) -> Result<cookie_bot::CookieBotScheduleList, String> {
-  cookie_bot::list_schedules(scope.as_deref())
-    .await
-    .map_err(|e| cookie_bot_error("schedule list", e))
-}
-
-/// This profile's enrolment, or `None` when it has none.
-#[tauri::command]
-async fn get_cookie_bot_schedule(
-  profile_id: String,
-) -> Result<Option<cookie_bot::CookieBotSchedule>, String> {
-  cookie_bot::get_schedule(&profile_id)
-    .await
-    .map_err(|e| cookie_bot_error("schedule read", e))
-}
-
-/// Create or replace this profile's enrolment.
-///
-/// `acknowledge_conflict` is the second half of a two-step write: a teammate's
-/// existing enrolment refuses the first PUT and names them, and the same call
-/// with the flag set goes through.
-#[tauri::command]
-async fn save_cookie_bot_schedule(
-  profile_id: String,
-  schedule: cookie_bot::CookieBotScheduleInput,
-  acknowledge_conflict: bool,
-) -> Result<cookie_bot::CookieBotScheduleSaved, String> {
-  // Refused here rather than at 02:00: a profile that can never be warmed
-  // should never reach a schedule row, an hour of quota or a leased host.
-  let profile = cookie_bot_profile(&profile_id)?;
-  cookie_bot::bot_precondition(&profile, &cookie_bot::exit_reachability(&profile))?;
-  // The frontend sends the user's choices; the profile facts the server refuses
-  // a run on are stamped here, from the profile itself, so a caller cannot
-  // assert them.
-  let schedule = schedule.with_profile_state(cookie_bot::profile_state(&profile));
-  cookie_bot::save_schedule(&profile_id, &schedule, acknowledge_conflict)
-    .await
-    .map_err(|e| cookie_bot_error("schedule write", e))
-}
-
-/// Turn the bot off for this profile. `false` means there was nothing enrolled.
-#[tauri::command]
-async fn delete_cookie_bot_schedule(profile_id: String) -> Result<bool, String> {
-  cookie_bot::delete_schedule(&profile_id)
-    .await
-    .map(|outcome| outcome.deleted)
-    .map_err(|e| cookie_bot_error("schedule delete", e))
-}
-
-/// Who else already warms this profile, without writing anything.
-#[tauri::command]
-async fn check_cookie_bot_conflicts(
-  profile_id: String,
-  run_at_minute: Option<u16>,
-  timezone: Option<String>,
-  days_mask: Option<u8>,
-) -> Result<Vec<cookie_bot::CookieBotConflict>, String> {
-  cookie_bot::check_conflicts(&profile_id, run_at_minute, timezone.as_deref(), days_mask)
-    .await
-    .map(|check| check.conflicts)
-    .map_err(|e| cookie_bot_error("conflict check", e))
-}
-
-/// One page of run history, newest first.
-#[tauri::command]
-async fn get_cookie_bot_runs(
-  profile_id: Option<String>,
-  scope: Option<String>,
-  limit: Option<u32>,
-  before: Option<String>,
-) -> Result<cookie_bot::CookieBotRunPage, String> {
-  cookie_bot::list_runs(
-    profile_id.as_deref(),
-    scope.as_deref(),
-    limit,
-    before.as_deref(),
-  )
-  .await
-  .map_err(|e| cookie_bot_error("run list", e))
-}
-
-/// Start a run now instead of waiting for tonight.
-///
-/// The preset and the site list come from the stored enrolment, so an
-/// unenrolled profile is refused rather than run with client-chosen defaults.
-#[tauri::command]
-async fn run_cookie_bot_now(
-  profile_id: String,
-  max_minutes: Option<u32>,
-) -> Result<cookie_bot::CookieBotRunStarted, String> {
-  let profile = cookie_bot_profile(&profile_id)?;
-  cookie_bot::bot_precondition(&profile, &cookie_bot::exit_reachability(&profile))?;
-  cookie_bot::run_now(&profile_id, max_minutes)
-    .await
-    .map_err(|e| cookie_bot_error("run start", e))
-}
-
-/// Stop a run that is still going.
-#[tauri::command]
-async fn cancel_cookie_bot_run(run_id: String) -> Result<cookie_bot::CookieBotRun, String> {
-  cookie_bot::cancel_run(&run_id)
-    .await
-    .map_err(|e| cookie_bot_error("run cancel", e))
-}
-
-/// The intensities the server offers today. Opaque ids and a typical duration —
-/// what each one actually does is the server's to know.
-#[tauri::command]
-async fn get_cookie_bot_presets() -> Result<cookie_bot::CookieBotPresetList, String> {
-  cookie_bot::list_presets()
-    .await
-    .map_err(|e| cookie_bot_error("preset list", e))
-}
-
-/// The pooled remote-hour budget: bot and interactive sessions share one pool.
-///
-/// Being refused a launch must not be the only way to learn a limit exists.
-#[tauri::command]
-async fn get_remote_hours_quota() -> Result<cookie_bot::RemoteHoursQuota, String> {
-  cookie_bot::remote_hours_quota()
-    .await
-    .map_err(|e| cookie_bot_error("quota read", e))
-}
-
-/// Per-member and per-profile spend for a calendar month (`YYYY-MM`).
-#[tauri::command]
-async fn get_cookie_bot_usage(
-  period: Option<String>,
-) -> Result<cookie_bot::CookieBotUsage, String> {
-  cookie_bot::team_usage(period.as_deref())
-    .await
-    .map_err(|e| cookie_bot_error("usage read", e))
-}
-
 /// Confirm a quit chosen from the close-confirmation dialog and exit the app.
 #[tauri::command]
 fn confirm_quit(app_handle: tauri::AppHandle) {
@@ -2267,28 +1973,6 @@ pub fn run_with_builder(
           }
         });
 
-        tauri::async_runtime::spawn(async move {
-          let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3 * 60 * 60));
-          loop {
-            interval.tick().await;
-            log::info!("Checking for app updates...");
-            match app_auto_updater::check_for_app_updates().await {
-              Ok(Some(update_info)) => {
-                log::info!(
-                  "App update available: {} -> {}",
-                  update_info.current_version,
-                  update_info.new_version
-                );
-                if let Err(e) = events::emit("app-update-available", &update_info) {
-                  log::error!("Failed to emit app update event: {e}");
-                }
-              }
-              Ok(None) => log::debug!("No app updates available"),
-              Err(e) => log::error!("Failed to check for app updates: {e}"),
-            }
-          }
-        });
-
         let app_handle_geoip = app.handle().clone();
         tauri::async_runtime::spawn(async move {
           tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -2493,16 +2177,6 @@ pub fn run_with_builder(
                     }
                   }
 
-                  // Release the cloud team lock when the browser exits naturally
-                  // (window closed by the user). The explicit kill path in
-                  // browser_runner.rs already releases it, but this branch did
-                  // not — leaking the lock, which the 30s heartbeat then renews
-                  // indefinitely. No-op for non-sync/non-paid
-                  // profiles thanks to the guards inside the helper.
-                  if !is_running {
-                    crate::team_lock::release_team_lock_if_needed(&profile).await;
-                  }
-
                   last_running_states.insert(profile_id, is_running);
                 } else {
                   // Update the state even if unchanged to ensure we have it tracked
@@ -2619,48 +2293,6 @@ pub fn run_with_builder(
         }
       });
 
-      // Start cloud auth background refresh loop
-      let app_handle_cloud = app.handle().clone();
-      tauri::async_runtime::spawn(async move {
-        // On startup, refresh sync token, proxy config, and wayfern token in
-        // PARALLEL. Previously they were awaited sequentially, so the wayfern
-        // token request didn't even start until the earlier two API calls had
-        // finished. Wayfern launch can race with this task — a few seconds of
-        // serialized API calls translates directly into a slow first launch
-        // because launch_wayfern blocks waiting for the token to land.
-        // api_call_with_retry handles 401/refresh internally — no direct
-        // refresh_access_token call needed.
-        if cloud_auth::CLOUD_AUTH.is_logged_in().await {
-          let sync_token_fut = async {
-            if let Err(e) = cloud_auth::CLOUD_AUTH.get_or_refresh_sync_token().await {
-              log::warn!("Failed to refresh cloud sync token on startup: {e}");
-            }
-          };
-          let proxy_fut = async {
-            cloud_auth::CLOUD_AUTH.sync_cloud_proxy().await;
-          };
-          let wayfern_fut = async {
-            if let Err(e) = cloud_auth::CLOUD_AUTH.request_wayfern_token().await {
-              log::warn!("Failed to request wayfern token on startup: {e}");
-            }
-          };
-          tokio::join!(sync_token_fut, proxy_fut, wayfern_fut);
-
-          // Subscribe to remote-session transitions. Started here rather than
-          // unconditionally because a signed-out desktop has nothing to stream
-          // and would only be refused on a loop; the frontend starts it again
-          // through `start_remote_session_events` once the user signs in.
-          remote_session::start_session_events(app_handle_cloud.clone());
-
-          // A session that finished while this machine was shut, or whose pull
-          // ran out of retries offline, leaves a profile blocked from launching
-          // with its work still in cloud storage. Signing in is the first moment
-          // that pull can succeed, so it is where it is retried.
-          remote_handoff::resume_pending_pulls(&app_handle_cloud);
-        }
-        cloud_auth::CloudAuthManager::start_sync_token_refresh_loop(app_handle_cloud).await;
-      });
-
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -2716,10 +2348,6 @@ pub fn run_with_builder(
       check_for_browser_updates,
       dismiss_update_notification,
       complete_browser_update_with_auto_update,
-      check_for_app_updates,
-      check_for_app_updates_manual,
-      download_and_prepare_app_update,
-      restart_application,
       detect_existing_profiles,
       import_browser_profiles,
       scan_folder_for_profiles,
@@ -2806,9 +2434,6 @@ pub fn run_with_builder(
       check_wayfern_terms_accepted,
       check_wayfern_downloaded,
       accept_wayfern_terms,
-      get_commercial_trial_status,
-      acknowledge_trial_expiration,
-      has_acknowledged_trial_expiration,
       start_mcp_server,
       stop_mcp_server,
       get_mcp_server_status,
@@ -2828,20 +2453,7 @@ pub fn run_with_builder(
       disconnect_vpn,
       get_vpn_status,
       list_active_vpn_connections,
-      // Cloud auth commands
-      cloud_auth::cloud_exchange_device_code,
-      cloud_auth::cloud_get_user,
-      cloud_auth::cloud_refresh_profile,
-      cloud_auth::cloud_logout,
-      cloud_auth::cloud_get_proxy_usage,
-      cloud_auth::cloud_get_countries,
-      cloud_auth::create_cloud_location_proxy,
-      cloud_auth::restart_sync_service,
-      cloud_auth::cloud_get_wayfern_token,
-      cloud_auth::cloud_refresh_wayfern_token,
-      // Team lock commands
-      team_lock::get_team_locks,
-      team_lock::get_team_lock_status,
+      settings_manager::restart_sync_service,
       // Synchronizer commands
       synchronizer::start_sync_session,
       synchronizer::stop_sync_session,
@@ -2854,34 +2466,6 @@ pub fn run_with_builder(
       dns_blocklist::set_custom_dns_config,
       dns_blocklist::import_custom_dns_rules,
       dns_blocklist::export_custom_dns_rules,
-      // Remote session commands
-      list_remote_sessions,
-      get_remote_session,
-      stop_remote_session,
-      get_remote_handoff_states,
-      start_remote_session_events,
-      stop_remote_session_events,
-      get_remote_session_events_status,
-      // Cookie bot commands
-      get_cookie_bot_schedules,
-      get_cookie_bot_schedule,
-      save_cookie_bot_schedule,
-      delete_cookie_bot_schedule,
-      check_cookie_bot_conflicts,
-      get_cookie_bot_runs,
-      run_cookie_bot_now,
-      cancel_cookie_bot_run,
-      get_cookie_bot_presets,
-      get_remote_hours_quota,
-      get_cookie_bot_usage,
-      // Defined in `cookie_bot.rs` rather than here because they carry no local
-      // precondition — there is no profile to look up and no `bot_precondition`
-      // to apply. Unregistered they are unreachable, and the saved-list tab
-      // fails at runtime with "command not found" rather than at build time.
-      cookie_bot::get_cookie_bot_user_templates,
-      cookie_bot::create_cookie_bot_user_template,
-      cookie_bot::update_cookie_bot_user_template,
-      cookie_bot::delete_cookie_bot_user_template,
       // Profile password commands
       set_profile_password,
       change_profile_password,
@@ -2894,12 +2478,6 @@ pub fn run_with_builder(
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|_app_handle, _event| {
-      // Drop the session stream before the runtime goes away, so a shutdown
-      // never waits out a reconnect backoff that is about to be pointless.
-      if let tauri::RunEvent::Exit = _event {
-        remote_session::stop_session_events();
-      }
-
       #[cfg(target_os = "macos")]
       if let tauri::RunEvent::Reopen { .. } = _event {
         if let Some(window) = _app_handle.get_webview_window("main") {
@@ -2934,30 +2512,6 @@ mod tests {
   }
 
   #[test]
-  fn the_frontend_listens_for_the_remote_session_events_that_are_emitted() {
-    // These names are the whole of BUG-2's fix: the backend answers a launch
-    // with `provisioning` and nothing else, so a desktop that subscribes to a
-    // name the emitter does not use is blind between launch and stop and shows
-    // nothing at all. Renaming one side is silent everywhere else.
-    let client = fs::read_to_string("../src/lib/remote-sessions.ts")
-      .expect("the frontend remote-session client must exist");
-    for event in [
-      crate::remote_session::EVENT_SESSION_STATE,
-      crate::remote_session::EVENT_SESSION_SNAPSHOT,
-      crate::remote_session::EVENT_STREAM_STATUS,
-      // The launch gate is emitted from the same place for the same reason: a
-      // Run button that does not hear about it stays enabled over a profile the
-      // backend will refuse, or over unsynced work it must not open.
-      crate::remote_handoff::EVENT_REMOTE_HANDOFF,
-    ] {
-      assert!(
-        client.contains(&format!("\"{event}\"")),
-        "no frontend listener for the emitted event {event}"
-      );
-    }
-  }
-
-  #[test]
   fn test_no_unused_tauri_commands() {
     check_unused_commands(false); // Run in strict mode for CI
   }
@@ -2980,10 +2534,7 @@ mod tests {
       "update_extension",
       "set_extension_sync_enabled",
       "set_extension_group_sync_enabled",
-      "get_team_lock_status",
       "generate_sample_fingerprint",
-      "cloud_get_wayfern_token",
-      "cloud_refresh_wayfern_token",
       "lock_profile",
     ];
 
@@ -3104,7 +2655,7 @@ mod tests {
             // Remove trailing comma and whitespace
             let command = line.trim_end_matches(',').trim();
             if !command.is_empty() {
-              // Strip module prefix (e.g., "cloud_auth::cloud_get_user" -> "cloud_get_user")
+              // Strip module prefix (e.g., "settings_manager::restart_sync_service" -> "restart_sync_service")
               let command = command.rsplit("::").next().unwrap_or(command);
               commands.push(command.to_string());
             }

@@ -27,7 +27,6 @@ import {
   LuCookie,
   LuInfo,
   LuLock,
-  LuMoon,
   LuPlay,
   LuPuzzle,
   LuSquare,
@@ -36,22 +35,6 @@ import {
   LuUserSearch,
   LuUsers,
 } from "react-icons/lu";
-import { CookieBotEnrolDialog } from "@/components/cookie-bot-enrol-dialog";
-import { CookieBotRunsDialog } from "@/components/cookie-bot-runs-dialog";
-import {
-  describeCadence,
-  enableProfileSync,
-  minutesToClock,
-  outcomeLabel,
-  type PreflightFix,
-  preflight,
-  preflightFixLabel,
-  preflightReason,
-  runStatusLabel,
-  StatusDot,
-  sessionPhaseLabel,
-  sessionTone,
-} from "@/components/cookie-bot-shared";
 import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog";
 import {
   ProfileBypassRulesDialog,
@@ -83,7 +66,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { ProBadge } from "@/components/ui/pro-badge";
 import {
   Table,
   TableBody,
@@ -98,13 +80,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useBrowserState } from "@/hooks/use-browser-state";
-import { useCloudAuth } from "@/hooks/use-cloud-auth";
-import { cookieBotScopeFor, useCookieBot } from "@/hooks/use-cookie-bot";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
-import { useRemoteHandoff } from "@/hooks/use-remote-handoff";
 import { useScrollFade } from "@/hooks/use-scroll-fade";
 import { useTableSorting } from "@/hooks/use-table-sorting";
-import { useTeamLocks } from "@/hooks/use-team-locks";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { parseBackendError, translateBackendError } from "@/lib/backend-errors";
 import {
@@ -113,23 +91,13 @@ import {
   getProfileIcon,
   isCrossOsProfile,
 } from "@/lib/browser-utils";
-import {
-  type CookieBotSchedule,
-  cancelCookieBotRun,
-  deleteCookieBotSchedule,
-  runCookieBotNow,
-} from "@/lib/cookie-bot";
 import { DNS_BLOCKLIST_LEVELS } from "@/lib/dns-blocklist-levels";
-import { canUseCookieBot } from "@/lib/entitlements";
 import { formatRelativeTime } from "@/lib/flag-utils";
-import type { RemoteHandoffState } from "@/lib/remote-sessions";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
 import type {
   BrowserProfile,
   ExtensionGroup,
-  LocationItem,
-  ProfileBotState,
   ProxyCheckResult,
   StoredProxy,
   SyncSessionInfo,
@@ -262,28 +230,6 @@ interface TableMeta {
   crossOsUnlocked?: boolean;
   syncUnlocked?: boolean;
 
-  // Country proxy creation (inline in proxy dropdown)
-  countries: LocationItem[];
-  canCreateLocationProxy: boolean;
-  loadCountries: () => Promise<void>;
-  handleCreateCountryProxy: (
-    profileId: string,
-    country: LocationItem,
-  ) => Promise<void>;
-
-  // Team locks
-  isProfileLockedByAnother: (profileId: string) => boolean;
-  getProfileLockEmail: (profileId: string) => string | undefined;
-
-  // Remote execution.
-  //
-  // `getRemoteHandoff` is the authoritative answer to "can this be opened
-  // here", read from the same store the backend gate reads. The team-lock cache
-  // above cannot serve it: it refreshes on a 30-second poll and says nothing at
-  // all about a session that has finished but whose work has not been pulled
-  // back yet.
-  getRemoteHandoff: (profileId: string) => RemoteHandoffState | null;
-
   // Synchronizer
   getProfileSyncInfo: (profileId: string) =>
     | {
@@ -293,51 +239,7 @@ interface TableMeta {
       }
     | undefined;
   onLaunchWithSync: (profile: BrowserProfile) => void;
-
-  // Cookie Bot
-  cookieBotUnlocked: boolean;
-  /** Narrow container: the bot column shows its state mark without the label. */
-  cookieBotCompact: boolean;
-  getProfileBotState: (profileId: string) => ProfileBotState;
-  /** A run this desktop has just asked for, before the stream confirms it. */
-  botPendingProfiles: Set<string>;
-  onBotEnrol: (profile: BrowserProfile) => void;
-  onBotEdit: (profile: BrowserProfile, schedule: CookieBotSchedule) => void;
-  onBotRunNow: (profile: BrowserProfile) => void;
-  onBotStopRun: (runId: string) => void;
-  onBotViewActivity: (profile: BrowserProfile) => void;
-  onBotUnenrol: (profile: BrowserProfile) => void;
-  /**
-   * Perform the repair a failed preflight names, or null when this surface has
-   * no way to reach it. A reason with no affordance is what the menu showed
-   * before: "No proxy or VPN · Attach a proxy" as inert label text that reads
-   * like a button and answers no click.
-   */
-  onBotFix: ((profile: BrowserProfile, fix: PreflightFix) => void) | null;
 }
-
-/**
- * Below this container width the bot column keeps its state mark but drops the
- * "next run" label: an operator still sees at a glance which rows are enrolled
- * and which are running, and the row menu stays reachable, without taking the
- * width the name needs.
- */
-const BOT_LABEL_WIDTH = 880;
-
-/** Below this the bot column leaves entirely, like the other low-priority ones. */
-const BOT_COLUMN_MIN_WIDTH = 400;
-
-/** Bulk enrolments of this size or larger are confirmed, as run and stop are. */
-const BULK_ENROL_CONFIRM_THRESHOLD = 10;
-
-/**
- * Run statuses that mean the browser never came up.
- *
- * `POST /cookie-bot/runs` answers 202 with the run row it recorded, so a
- * refusal — no capacity, no sites, a profile someone else has open — arrives as
- * a successful response carrying a terminal status.
- */
-const RUN_DID_NOT_START = new Set(["skipped", "failed", "cancelled"]);
 
 interface SyncStatusDot {
   color: string;
@@ -1202,196 +1104,6 @@ const NoteCell = React.memo<{
 
 NoteCell.displayName = "NoteCell";
 
-/** `HH:MM` of the server's own next-run instant, in this machine's locale. */
-function formatNextRun(schedule: CookieBotSchedule): string | null {
-  if (!schedule.next_run_at) return null;
-  const date = new Date(schedule.next_run_at);
-  if (Number.isNaN(date.getTime())) return null;
-  return date.toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/**
- * One row's Cookie Bot state, and the row's bot actions.
- *
- * The whole cell is the menu trigger. A dedicated kebab would cost another
- * column of width in a table that is already dense, and the state mark is
- * exactly the thing an operator reaches for when they want to change it. The
- * dot, the tone and the phase wording all come from the shared status
- * vocabulary, so a run cannot read one way here and another on the Cookie Bot
- * page.
- */
-const BotCell = React.memo<{
-  profile: BrowserProfile;
-  meta: TableMeta;
-}>(({ profile, meta }) => {
-  // Own `t` rather than `meta.t`: the shared status helpers take a real
-  // `TFunction`, and every other cell in this file resolves it the same way.
-  const { t } = useTranslation();
-  const { schedule, liveSession } = meta.getProfileBotState(profile.id);
-  const check = preflight(profile);
-  const isPending = meta.botPendingProfiles.has(profile.id);
-  const isLive = liveSession !== null;
-  const nextRun = schedule ? formatNextRun(schedule) : null;
-
-  // The server computes "why tonight would be refused" on every read, precisely
-  // so a detached proxy is visible in the afternoon rather than announcing
-  // itself as a skipped run at 02:00. Dropping it left a broken enrolment
-  // showing a healthy dot and a next-run time it could never keep.
-  const blockedReason =
-    schedule?.enabled && schedule.blocked_by
-      ? outcomeLabel(t, schedule.blocked_by)
-      : null;
-
-  // `provisioning` is a transfer in progress — the one meaning the app already
-  // reserves a pulsing dot for. Nothing else pulses.
-  const isPreparing = liveSession?.state === "provisioning" || isPending;
-  const tone = liveSession
-    ? sessionTone(liveSession)
-    : isPending
-      ? "warning"
-      : schedule
-        ? schedule.enabled && !blockedReason
-          ? "muted"
-          : "warning"
-        : null;
-
-  const label = isPending
-    ? t("cookieBot.status.provisioning")
-    : liveSession
-      ? sessionPhaseLabel(t, liveSession)
-      : schedule
-        ? !schedule.enabled
-          ? t("cookieBot.state.paused")
-          : (blockedReason ?? nextRun ?? t("cookieBot.state.enrolled"))
-        : "—";
-
-  const summary = schedule
-    ? blockedReason
-      ? t("cookieBot.state.blocked", { reason: blockedReason })
-      : t("cookieBot.state.summary", {
-          cadence: describeCadence(t, schedule.days_mask),
-          time: minutesToClock(schedule.run_at_minute),
-        })
-    : check.eligible
-      ? t("cookieBot.state.notEnrolled")
-      : // The repair is its own menu item when this surface can reach it, so
-        // the label stays a statement instead of looking like a second button.
-        [
-          preflightReason(t, check),
-          meta.onBotFix ? null : preflightFixLabel(t, check.fix),
-        ]
-          .filter(Boolean)
-          .join(" · ");
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={t("cookieBot.state.rowMenu", { name: profile.name })}
-          className="flex h-9 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded border-none bg-transparent px-1.5 text-left transition-colors duration-100 hover:bg-muted"
-        >
-          {tone ? (
-            <StatusDot tone={tone} pulse={isPreparing} className="size-1.5" />
-          ) : (
-            <span aria-hidden="true" className="size-1.5 shrink-0" />
-          )}
-          {!meta.cookieBotCompact && (
-            <span
-              className={cn(
-                "min-w-0 truncate text-xs tabular-nums",
-                isLive || isPending
-                  ? "text-foreground"
-                  : "text-muted-foreground",
-              )}
-            >
-              {label}
-            </span>
-          )}
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-56">
-        <DropdownMenuLabel className="font-normal text-muted-foreground">
-          {summary}
-        </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {schedule ? (
-          <>
-            <DropdownMenuItem
-              onClick={() => {
-                meta.onBotEdit(profile, schedule);
-              }}
-            >
-              {t("cookieBot.actions.editSchedule")}
-            </DropdownMenuItem>
-            {liveSession?.run_id ? (
-              <DropdownMenuItem
-                onClick={() => {
-                  if (liveSession.run_id) {
-                    meta.onBotStopRun(liveSession.run_id);
-                  }
-                }}
-              >
-                {t("cookieBot.running.stop")}
-              </DropdownMenuItem>
-            ) : (
-              <DropdownMenuItem
-                disabled={isLive || isPending}
-                onClick={() => {
-                  meta.onBotRunNow(profile);
-                }}
-              >
-                {t("cookieBot.actions.runNow")}
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem
-              onClick={() => {
-                meta.onBotViewActivity(profile);
-              }}
-            >
-              {t("cookieBot.actions.viewActivity")}
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              variant="destructive"
-              onClick={() => {
-                meta.onBotUnenrol(profile);
-              }}
-            >
-              {t("cookieBot.schedule.unenrol")}
-            </DropdownMenuItem>
-          </>
-        ) : (
-          <>
-            {!check.eligible && check.fix && meta.onBotFix && (
-              <DropdownMenuItem
-                onClick={() => {
-                  meta.onBotFix?.(profile, check.fix as PreflightFix);
-                }}
-              >
-                {preflightFixLabel(t, check.fix)}
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem
-              disabled={!check.eligible}
-              onClick={() => {
-                meta.onBotEnrol(profile);
-              }}
-            >
-              {t("cookieBot.actions.enrol")}
-            </DropdownMenuItem>
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-});
-
-BotCell.displayName = "BotCell";
-
 interface ProfilesDataTableProps {
   profiles: BrowserProfile[];
   onLaunchProfile: (profile: BrowserProfile) => void | Promise<unknown>;
@@ -1594,36 +1306,6 @@ export function ProfilesDataTable({
 
   const { storedProxies } = useProxyEvents();
   const { vpnConfigs } = useVpnEvents();
-  const { user } = useCloudAuth();
-  const { isProfileLocked, getLockInfo } = useTeamLocks(user?.id);
-  // Which profiles cannot be opened on this computer, and why. Event-driven and
-  // read from the backend's own gate, so the button state and the refusal the
-  // backend would give can never disagree.
-  const { handoffFor } = useRemoteHandoff();
-
-  // Cookie Bot. Enrolments and live runs both live server-side, so the table
-  // reads them from the shared store rather than from BrowserProfile.
-  const cookieBotUnlocked = canUseCookieBot(user);
-  const {
-    scheduleFor,
-    liveSessionFor,
-    refresh: refreshCookieBotState,
-  } = useCookieBot(cookieBotUnlocked, cookieBotScopeFor(user));
-  const [botPendingProfiles, setBotPendingProfiles] = React.useState<
-    Set<string>
-  >(new Set());
-  const [botScheduleDialog, setBotScheduleDialog] = React.useState<{
-    profiles: BrowserProfile[];
-    existing: CookieBotSchedule | null;
-  } | null>(null);
-  const [botRunsProfile, setBotRunsProfile] =
-    React.useState<BrowserProfile | null>(null);
-  const [botUnenrolProfile, setBotUnenrolProfile] =
-    React.useState<BrowserProfile | null>(null);
-  const [isUnenrolling, setIsUnenrolling] = React.useState(false);
-  const [pendingBulkEnrol, setPendingBulkEnrol] = React.useState<
-    BrowserProfile[] | null
-  >(null);
 
   // Content columns grow proportionally with the container but never drop
   // below the compact-layout floor; the name column takes the remainder.
@@ -1671,10 +1353,6 @@ export function ProfilesDataTable({
     Record<string, { status: string; error?: string }>
   >({});
 
-  // Country proxy creation state (for inline proxy creation in dropdown)
-  const [countries, setCountries] = React.useState<LocationItem[]>([]);
-  const [countriesLoaded, setCountriesLoaded] = React.useState(false);
-
   // Extension groups for the Ext column lookup. Refreshed when the
   // backend emits 'extensions-changed' (group rename/create/delete).
   const [extensionGroups, setExtensionGroups] = React.useState<
@@ -1704,18 +1382,6 @@ export function ProfilesDataTable({
       unlisten?.();
     };
   }, []);
-  const canCreateLocationProxy = false;
-
-  const loadCountries = React.useCallback(async () => {
-    if (countriesLoaded || !canCreateLocationProxy) return;
-    try {
-      const data = await invoke<LocationItem[]>("cloud_get_countries");
-      setCountries(data);
-      setCountriesLoaded(true);
-    } catch (e) {
-      console.error("Failed to load countries:", e);
-    }
-  }, [countriesLoaded]);
 
   // Load cached check results for proxies
   React.useEffect(() => {
@@ -1793,172 +1459,6 @@ export function ProfilesDataTable({
     },
     [],
   );
-
-  const handleCreateCountryProxy = React.useCallback(
-    async (profileId: string, country: LocationItem) => {
-      try {
-        await invoke("create_cloud_location_proxy", {
-          name: country.name,
-          country: country.code,
-          region: null,
-          city: null,
-          isp: null,
-        });
-        await emit("stored-proxies-changed");
-        // Wait briefly for proxy list to update, then find and assign the new proxy
-        await new Promise((r) => setTimeout(r, 200));
-        const updatedProxies =
-          await invoke<StoredProxy[]>("get_stored_proxies");
-        const newProxy = updatedProxies.find(
-          (p: StoredProxy) =>
-            p.is_cloud_derived && p.geo_country === country.code,
-        );
-        if (newProxy) {
-          await handleProxySelection(profileId, newProxy.id);
-        }
-        setOpenProxySelectorFor(null);
-      } catch (error) {
-        console.error("Failed to create country proxy:", error);
-      }
-    },
-    [handleProxySelection],
-  );
-
-  const getProfileBotState = React.useCallback(
-    (profileId: string): ProfileBotState => ({
-      schedule: scheduleFor(profileId),
-      liveSession: liveSessionFor(profileId),
-    }),
-    [scheduleFor, liveSessionFor],
-  );
-
-  const handleBotEnrol = React.useCallback((profile: BrowserProfile) => {
-    setBotScheduleDialog({ profiles: [profile], existing: null });
-  }, []);
-
-  const handleBotEdit = React.useCallback(
-    (profile: BrowserProfile, schedule: CookieBotSchedule) => {
-      setBotScheduleDialog({ profiles: [profile], existing: schedule });
-    },
-    [],
-  );
-
-  const handleBotViewActivity = React.useCallback((profile: BrowserProfile) => {
-    setBotRunsProfile(profile);
-  }, []);
-
-  const handleBotFix = React.useCallback(
-    (profile: BrowserProfile, fix: PreflightFix) => {
-      if (fix === "proxy") {
-        onAssignProfilesToProxy?.([profile.id]);
-        return;
-      }
-      if (fix === "syncSettings") {
-        onOpenProfileSyncDialog?.(profile);
-        return;
-      }
-      void enableProfileSync(profile.id).catch((error: unknown) => {
-        showErrorToast(
-          parseBackendError(error)
-            ? translateBackendError(t as never, error)
-            : t("cookieBot.preflight.fixFailed"),
-        );
-      });
-    },
-    [onAssignProfilesToProxy, onOpenProfileSyncDialog, t],
-  );
-
-  // Null rather than a no-op when nothing is wired: the menu then states the
-  // reason without offering a repair it cannot perform.
-  const botFixHandler =
-    onAssignProfilesToProxy || onOpenProfileSyncDialog ? handleBotFix : null;
-
-  const handleBotRunNow = React.useCallback(
-    async (profile: BrowserProfile) => {
-      // Held locally until the stream reports the session: the run is real the
-      // moment the command returns, and a row that still looks idle invites a
-      // second click that would spend a second hour.
-      setBotPendingProfiles((prev) => new Set(prev).add(profile.id));
-      try {
-        const started = await runCookieBotNow(profile.id);
-        // 202, not 200: the route answers with a RECORDED run, and a run that
-        // could not get a host comes back already terminal, carrying an
-        // `outcome_code`, rather than as an HTTP error. Treating every 2xx as
-        // "started" told a user their run had begun on a night when every
-        // Windows host in a four-slot fleet was busy, and the only trace was a
-        // row in a history panel they had to go and open.
-        if (RUN_DID_NOT_START.has(started.run.status)) {
-          showErrorToast(
-            t("cookieBot.actions.runNotStarted", {
-              reason:
-                outcomeLabel(t as never, started.run.outcome_code) ??
-                runStatusLabel(t as never, started.run.status),
-            }),
-          );
-        } else {
-          showSuccessToast(t("cookieBot.actions.runStarted"));
-        }
-        await refreshCookieBotState();
-      } catch (error) {
-        showErrorToast(translateBackendError(t as never, error));
-      } finally {
-        setBotPendingProfiles((prev) => {
-          const next = new Set(prev);
-          next.delete(profile.id);
-          return next;
-        });
-      }
-    },
-    [refreshCookieBotState, t],
-  );
-
-  const handleBotStopRun = React.useCallback(
-    async (runId: string) => {
-      try {
-        await cancelCookieBotRun(runId);
-        showSuccessToast(t("cookieBot.running.stopped"));
-        await refreshCookieBotState();
-      } catch (error) {
-        showErrorToast(translateBackendError(t as never, error));
-      }
-    },
-    [refreshCookieBotState, t],
-  );
-
-  const handleBotUnenrol = React.useCallback(async () => {
-    if (!botUnenrolProfile) return;
-    setIsUnenrolling(true);
-    try {
-      await deleteCookieBotSchedule(botUnenrolProfile.id);
-      showSuccessToast(t("cookieBot.schedule.unenrolled"));
-      setBotUnenrolProfile(null);
-      await refreshCookieBotState();
-    } catch (error) {
-      showErrorToast(translateBackendError(t as never, error));
-    } finally {
-      setIsUnenrolling(false);
-    }
-  }, [botUnenrolProfile, refreshCookieBotState, t]);
-
-  const handleBulkCookieBotEnrol = React.useCallback(() => {
-    const targets = profiles.filter((p) => selectedProfiles.includes(p.id));
-    if (targets.length === 0) return;
-    const eligible = targets.filter((p) => preflight(p).eligible);
-    // Same guard as bulk run: an action that can touch nothing says so instead
-    // of opening a dialog whose only outcome is a refusal.
-    if (eligible.length === 0) {
-      showErrorToast(t("cookieBot.actionBar.noneEligible"));
-      return;
-    }
-    // Ten or more is the threshold bulk run and stop already use, and enrolling
-    // is the heavier commitment of the three: each row books a nightly job
-    // against a shared budget.
-    if (eligible.length >= BULK_ENROL_CONFIRM_THRESHOLD) {
-      setPendingBulkEnrol(targets);
-      return;
-    }
-    setBotScheduleDialog({ profiles: targets, existing: null });
-  }, [profiles, selectedProfiles, t]);
 
   // Use shared browser state hook
   const browserState = useBrowserState(
@@ -2449,20 +1949,6 @@ export function ProfilesDataTable({
       crossOsUnlocked,
       syncUnlocked,
 
-      // Country proxy creation
-      countries,
-      canCreateLocationProxy,
-      loadCountries,
-      handleCreateCountryProxy,
-
-      // Team locks
-      isProfileLockedByAnother: isProfileLocked,
-      getProfileLockEmail: (profileId: string) =>
-        getLockInfo(profileId)?.lockedByEmail,
-
-      // Remote execution
-      getRemoteHandoff: handoffFor,
-
       // Synchronizer
       getProfileSyncInfo: getProfileSyncInfo ?? (() => undefined),
       onLaunchWithSync:
@@ -2470,23 +1956,6 @@ export function ProfilesDataTable({
         (() => {
           /* empty */
         }),
-
-      // Cookie Bot
-      cookieBotUnlocked,
-      cookieBotCompact: containerWidth > 0 && containerWidth < BOT_LABEL_WIDTH,
-      getProfileBotState,
-      botPendingProfiles,
-      onBotEnrol: handleBotEnrol,
-      onBotEdit: handleBotEdit,
-      onBotRunNow: (profile: BrowserProfile) => {
-        void handleBotRunNow(profile);
-      },
-      onBotStopRun: (runId: string) => {
-        void handleBotStopRun(runId);
-      },
-      onBotViewActivity: handleBotViewActivity,
-      onBotUnenrol: setBotUnenrolProfile,
-      onBotFix: botFixHandler,
     }),
     [
       t,
@@ -2537,24 +2006,8 @@ export function ProfilesDataTable({
       onToggleProfileSync,
       crossOsUnlocked,
       syncUnlocked,
-      countries,
-      loadCountries,
-      handleCreateCountryProxy,
-      isProfileLocked,
-      getLockInfo,
-      handoffFor,
       getProfileSyncInfo,
       onLaunchWithSync,
-      cookieBotUnlocked,
-      containerWidth,
-      getProfileBotState,
-      botPendingProfiles,
-      handleBotEnrol,
-      handleBotEdit,
-      handleBotRunNow,
-      handleBotStopRun,
-      handleBotViewActivity,
-      botFixHandler,
     ],
   );
 
@@ -2744,37 +2197,15 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
-          const handoff = meta.getRemoteHandoff(profile.id);
-          // A profile open on the fleet IS running, and the button has to say
-          // so: it is the control that stops it, and stopping now reaches the
-          // remote browser rather than looking for a local process that was
-          // never there.
-          const isRunningRemotely = handoff === "running";
-          const isPendingRemotePull = handoff === "pending_sync";
           const isRunning =
-            (meta.isClient && meta.runningProfiles.has(profile.id)) ||
-            isRunningRemotely;
+            meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isLockedByAnother = meta.isProfileLockedByAnother(profile.id);
           const isSyncing = meta.syncStatuses[profile.id]?.status === "syncing";
-          // A remote session holds the profile lock under its own holder id, so
-          // `isLockedByAnother` is true for the user's OWN fleet session. That
-          // must not disable the control that stops it.
-          const canLaunch = isRunningRemotely
-            ? true
-            : meta.browserState.canLaunchProfile(profile) &&
-              !isPendingRemotePull &&
-              !isLockedByAnother &&
-              !isSyncing;
-          const lockEmail = meta.getProfileLockEmail(profile.id);
-          const tooltipContent = isRunningRemotely
-            ? meta.t("profiles.remote.runningTooltip")
-            : isPendingRemotePull
-              ? meta.t("profiles.remote.pendingSyncTooltip")
-              : isLockedByAnother
-                ? meta.t("sync.team.cannotLaunchLocked", { email: lockEmail })
-                : meta.browserState.getLaunchTooltipContent(profile);
+          const canLaunch =
+            meta.browserState.canLaunchProfile(profile) && !isSyncing;
+          const tooltipContent =
+            meta.browserState.getLaunchTooltipContent(profile);
 
           const handleProfileStop = async (profile: BrowserProfile) => {
             meta.setStoppingProfiles((prev: Set<string>) =>
@@ -3094,8 +2525,6 @@ export function ProfilesDataTable({
             />
           );
 
-          const lockedEmail = meta.getProfileLockEmail(profile.id);
-          const isLocked = meta.isProfileLockedByAnother(profile.id);
           const nameControl = isRuntimeLocked ? (
             <div className="mr-auto h-6 max-w-full min-w-0 cursor-text overflow-hidden rounded px-2 py-1 text-left select-text">
               {display}
@@ -3132,18 +2561,6 @@ export function ProfilesDataTable({
           return (
             <div className="flex max-w-full min-w-0 items-center gap-1.5 overflow-hidden">
               {nameControl}
-              {isLocked && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <LuLock className="size-3 text-muted-foreground" />
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    {meta.t("sync.team.profileLocked", { email: lockedEmail })}
-                  </TooltipContent>
-                </Tooltip>
-              )}
             </div>
           );
         },
@@ -3292,15 +2709,7 @@ export function ProfilesDataTable({
                   >
                     <Command>
                       <CommandInput
-                        placeholder={
-                          meta.canCreateLocationProxy
-                            ? t("createProfile.proxy.searchWithCountries")
-                            : t("createProfile.proxy.search")
-                        }
-                        onFocus={() => {
-                          if (meta.canCreateLocationProxy)
-                            void meta.loadCountries();
-                        }}
+                        placeholder={t("createProfile.proxy.search")}
                       />
                       <CommandList>
                         <CommandEmpty>
@@ -3323,13 +2732,7 @@ export function ProfilesDataTable({
                             />
                             {t("common.labels.none")}
                           </CommandItem>
-                          {meta.storedProxies
-                            .filter(
-                              (proxy: StoredProxy) =>
-                                !proxy.is_cloud_managed &&
-                                !proxy.is_cloud_derived,
-                            )
-                            .map((proxy: StoredProxy) => (
+                          {meta.storedProxies.map((proxy: StoredProxy) => (
                               <CommandItem
                                 key={proxy.id}
                                 value={proxy.name}
@@ -3385,37 +2788,6 @@ export function ProfilesDataTable({
                             ))}
                           </CommandGroup>
                         )}
-                        {meta.canCreateLocationProxy &&
-                          meta.countries.length > 0 && (
-                            <CommandGroup
-                              heading={t("profileTable.createByCountryHeading")}
-                            >
-                              {meta.countries
-                                .filter(
-                                  (c) =>
-                                    !meta.storedProxies.some(
-                                      (p) =>
-                                        p.is_cloud_derived &&
-                                        p.geo_country === c.code,
-                                    ),
-                                )
-                                .map((country) => (
-                                  <CommandItem
-                                    key={`country-${country.code}`}
-                                    value={`create-${country.name}`}
-                                    onSelect={() =>
-                                      void meta.handleCreateCountryProxy(
-                                        profile.id,
-                                        country,
-                                      )
-                                    }
-                                  >
-                                    <span className="mr-2 size-4" />+{" "}
-                                    {country.name}
-                                  </CommandItem>
-                                ))}
-                            </CommandGroup>
-                          )}
                       </CommandList>
                     </Command>
                   </PopoverContent>
@@ -3470,19 +2842,6 @@ export function ProfilesDataTable({
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
           return <DnsCell profile={profile} meta={meta} />;
-        },
-      },
-      {
-        id: "bot",
-        size: 84,
-        header: ({ table }) => {
-          const meta = table.options.meta as TableMeta;
-          if (meta.cookieBotCompact) return null;
-          return meta.t("profiles.table.bot");
-        },
-        cell: ({ row, table }) => {
-          const meta = table.options.meta as TableMeta;
-          return <BotCell profile={row.original} meta={meta} />;
         },
       },
       {
@@ -3562,11 +2921,8 @@ export function ProfilesDataTable({
   // Low-priority columns leave the table as the container narrows (most
   // expendable first); their data stays reachable via the profile info
   // dialog. Visibility (not CSS hiding) so table-fixed reclaims the width.
-  // `bot` starts hidden and is switched on by the resize effect below. An
-  // unentitled account must never see a paid column, not even for the frame
-  // before the observer's first measurement lands.
   const [columnVisibility, setColumnVisibility] =
-    React.useState<VisibilityState>({ created_at: false, bot: false });
+    React.useState<VisibilityState>({ created_at: false });
 
   const table = useReactTable({
     data: profiles,
@@ -3596,14 +2952,6 @@ export function ProfilesDataTable({
   const scrollParentRef = React.useRef<HTMLDivElement | null>(null);
   const columnWidth = React.useCallback(
     (id: string, sizePx: number) => {
-      // The bot column is the one column with two shapes: a labelled state at
-      // full width, a bare mark when the table is narrow. Taking a proportion
-      // in the compact shape would waste the space the name column needs.
-      if (id === "bot") {
-        return containerWidth > 0 && containerWidth < BOT_LABEL_WIDTH
-          ? "28px"
-          : `${Math.max(84, Math.round(containerWidth * 0.09))}px`;
-      }
       const proportions: Record<string, { pct: number; floor: number }> = {
         tags: { pct: 0.12, floor: 100 },
         note: { pct: 0.1, floor: 80 },
@@ -3634,10 +2982,6 @@ export function ProfilesDataTable({
           ext: w >= 672,
           note: w >= 576,
           tags: w >= 512,
-          // Bot state survives further down than the other content columns:
-          // by then it is a 28px mark, and it is the only place a row's
-          // enrolment and its actions can be reached.
-          bot: cookieBotUnlocked && w >= BOT_COLUMN_MIN_WIDTH,
         };
         return Object.keys(next).every((k) => prev[k] === next[k])
           ? prev
@@ -3650,7 +2994,7 @@ export function ProfilesDataTable({
     return () => {
       ro.disconnect();
     };
-  }, [cookieBotUnlocked]);
+  }, []);
 
   // Compact 36px row from the redesign spec; estimateSize must match the
   // actual rendered row height or virtualizer placement drifts under scroll.
@@ -3953,42 +3297,24 @@ export function ProfilesDataTable({
       <DataTableActionBar table={table}>
         <DataTableActionBarSelection table={table} />
         {onBulkRun && (
-          <span className="relative inline-flex">
-            <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.runSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkRun : undefined}
-              disabled={!bulkActionsUnlocked}
-              size="icon"
-            >
-              <LuPlay className="fill-current" />
-            </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
-          </span>
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.runSelected")}
+            onClick={onBulkRun}
+            disabled={!bulkActionsUnlocked}
+            size="icon"
+          >
+            <LuPlay className="fill-current" />
+          </DataTableActionBarAction>
         )}
         {onBulkStop && (
-          <span className="relative inline-flex">
-            <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.stopSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkStop : undefined}
-              disabled={!bulkActionsUnlocked}
-              size="icon"
-            >
-              <LuSquare className="fill-current" />
-            </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
-          </span>
+          <DataTableActionBarAction
+            tooltip={t("profiles.actionBar.stopSelected")}
+            onClick={onBulkStop}
+            disabled={!bulkActionsUnlocked}
+            size="icon"
+          >
+            <LuSquare className="fill-current" />
+          </DataTableActionBarAction>
         )}
         {onBulkGroupAssignment && (
           <DataTableActionBarAction
@@ -4026,23 +3352,6 @@ export function ProfilesDataTable({
             <LuCookie />
           </DataTableActionBarAction>
         )}
-        <span className="relative inline-flex">
-          <DataTableActionBarAction
-            tooltip={
-              cookieBotUnlocked
-                ? t("cookieBot.actionBar.enrol")
-                : t("cookieBot.actionBar.proRequired")
-            }
-            onClick={cookieBotUnlocked ? handleBulkCookieBotEnrol : undefined}
-            disabled={!cookieBotUnlocked}
-            size="icon"
-          >
-            <LuMoon />
-          </DataTableActionBarAction>
-          {!cookieBotUnlocked && (
-            <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-          )}
-        </span>
         {onBulkDelete && (
           <DataTableActionBarAction
             tooltip={t("common.buttons.delete")}
@@ -4088,85 +3397,6 @@ export function ProfilesDataTable({
         }}
         profileId={launchHookProfile?.id ?? null}
         currentLaunchHook={launchHookProfile?.launch_hook ?? null}
-      />
-      {botScheduleDialog && (
-        <CookieBotEnrolDialog
-          isOpen
-          onClose={() => {
-            setBotScheduleDialog(null);
-          }}
-          profiles={botScheduleDialog.profiles}
-          existing={botScheduleDialog.existing}
-          onOpenProfileSync={onOpenProfileSyncDialog}
-          // "A proxy or VPN is required" is the precondition most profiles
-          // fail, and without this the dialog showed the reason with no way to
-          // act on it — one-click fixable from the Cookie Bot page and a dead
-          // end from the row menu that is the primary entry point.
-          onAssignProxy={onAssignProfilesToProxy}
-          onSaved={() => {
-            // Clearing after a bulk write mirrors the other bulk actions: the
-            // selection has been acted on, and leaving it live invites a second
-            // pass over profiles that are already enrolled.
-            if (botScheduleDialog.profiles.length > 1) {
-              onSelectedProfilesChange([]);
-            }
-          }}
-        />
-      )}
-      <DeleteConfirmationDialog
-        isOpen={pendingBulkEnrol !== null}
-        onClose={() => {
-          setPendingBulkEnrol(null);
-        }}
-        onConfirm={() => {
-          if (!pendingBulkEnrol) return;
-          setBotScheduleDialog({
-            profiles: pendingBulkEnrol,
-            existing: null,
-          });
-          setPendingBulkEnrol(null);
-        }}
-        title={t("cookieBot.enrol.confirmBulkTitle", {
-          count:
-            pendingBulkEnrol?.filter((p) => preflight(p).eligible).length ?? 0,
-        })}
-        description={t("cookieBot.enrol.confirmBulkDescription", {
-          count:
-            pendingBulkEnrol?.filter((p) => preflight(p).eligible).length ?? 0,
-        })}
-        confirmButtonText={t("cookieBot.enrol.confirmBulkButton", {
-          count:
-            pendingBulkEnrol?.filter((p) => preflight(p).eligible).length ?? 0,
-        })}
-        confirmButtonVariant="default"
-        profileIds={pendingBulkEnrol
-          ?.filter((p) => preflight(p).eligible)
-          .map((p) => p.id)}
-        profiles={pendingBulkEnrol?.map((p) => ({ id: p.id, name: p.name }))}
-      />
-      <CookieBotRunsDialog
-        isOpen={botRunsProfile !== null}
-        onClose={() => {
-          setBotRunsProfile(null);
-        }}
-        profileId={botRunsProfile?.id ?? null}
-        profileName={botRunsProfile?.name}
-        onRunCancelled={() => {
-          void refreshCookieBotState();
-        }}
-      />
-      <DeleteConfirmationDialog
-        isOpen={botUnenrolProfile !== null}
-        onClose={() => {
-          setBotUnenrolProfile(null);
-        }}
-        onConfirm={handleBotUnenrol}
-        title={t("cookieBot.schedule.unenrolTitle", {
-          name: botUnenrolProfile?.name ?? "",
-        })}
-        description={t("cookieBot.schedule.unenrolDescription")}
-        confirmButtonText={t("cookieBot.schedule.unenrol")}
-        isLoading={isUnenrolling}
       />
     </>
   );

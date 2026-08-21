@@ -33,7 +33,6 @@ pub enum SyncWorkItem {
 /// fresh one (tokens are short-lived, ~15 min).
 #[derive(Clone, Copy)]
 enum TokenSource {
-  Cloud,
   SelfHosted,
 }
 
@@ -67,20 +66,7 @@ impl SyncSubscription {
     app_handle: &tauri::AppHandle,
     work_tx: mpsc::UnboundedSender<SyncWorkItem>,
   ) -> Result<Option<Self>, String> {
-    // Cloud auth takes priority
-    if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
-      let url = crate::cloud_auth::CLOUD_SYNC_URL.to_string();
-      let token = crate::cloud_auth::CLOUD_AUTH
-        .get_or_refresh_sync_token()
-        .await
-        .map_err(|e| format!("Failed to get cloud sync token: {e}"))?;
-      let Some(token) = token else {
-        return Ok(None);
-      };
-      return Ok(Some(Self::new(url, token, TokenSource::Cloud, work_tx)));
-    }
-
-    // Fall back to self-hosted settings
+    // Load self-hosted sync settings
     let manager = SettingsManager::instance();
     let settings = manager
       .load_settings()
@@ -171,10 +157,6 @@ impl SyncSubscription {
     app_handle: &tauri::AppHandle,
   ) -> Result<Option<String>, String> {
     match source {
-      TokenSource::Cloud => crate::cloud_auth::CLOUD_AUTH
-        .get_or_refresh_sync_token()
-        .await
-        .map_err(|e| format!("Failed to refresh cloud sync token: {e}")),
       TokenSource::SelfHosted => SettingsManager::instance()
         .get_sync_token(app_handle)
         .await
@@ -257,19 +239,6 @@ impl SyncSubscription {
     data_line.and_then(|data| serde_json::from_str(data).ok())
   }
 
-  fn strip_team_prefix(key: &str) -> &str {
-    if key.starts_with("teams/") {
-      if let Some(rest) = key.find('/').and_then(|first_slash| {
-        key[first_slash + 1..]
-          .find('/')
-          .map(|second_slash| first_slash + 1 + second_slash + 1)
-      }) {
-        return &key[rest..];
-      }
-    }
-    key
-  }
-
   fn handle_event(event: &SubscribeEvent, work_tx: &mpsc::UnboundedSender<SyncWorkItem>) {
     let Some(raw_key) = &event.key else {
       return;
@@ -279,7 +248,7 @@ impl SyncSubscription {
       return;
     }
 
-    let key = Self::strip_team_prefix(raw_key);
+    let key = raw_key.as_str();
 
     let work_item = if key.starts_with("profiles/") {
       // Match both bundle uploads (profiles/{id}.tar.gz) and delta sync updates

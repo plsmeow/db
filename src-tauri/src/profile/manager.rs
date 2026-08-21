@@ -1,5 +1,4 @@
 use crate::browser::{create_browser, BrowserType};
-use crate::cloud_auth::CLOUD_AUTH;
 use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
 use crate::events;
 use crate::profile::types::{get_host_os, is_host_os, BrowserProfile, SyncMode};
@@ -95,14 +94,6 @@ impl ProfileManager {
     }
 
     let launch_hook = Self::normalize_launch_hook(launch_hook)?;
-
-    // Sync cloud proxy credentials if the profile uses a cloud or cloud-derived proxy
-    if let Some(ref pid) = proxy_id {
-      if PROXY_MANAGER.is_cloud_or_derived(pid) || pid == crate::proxy_manager::CLOUD_PROXY_ID {
-        log::info!("Syncing cloud proxy credentials before profile creation");
-        CLOUD_AUTH.sync_cloud_proxy().await;
-      }
-    }
 
     log::info!("Attempting to create profile: {name}");
 
@@ -1217,12 +1208,6 @@ impl ProfileManager {
 
     crate::sync::queue_profile_sync_if_eligible(&profile);
 
-    // The cookie bot refuses a run on a profile with no exit node, using the
-    // copy of that fact the desktop last declared. Detaching a proxy has to
-    // move that copy, or tonight's run egresses from the leased host's own
-    // datacenter address.
-    crate::cookie_bot::report_profile_state(&profile);
-
     // Auto-enable sync for new proxy if profile has sync enabled
     if profile.is_sync_enabled() {
       if let Some(ref new_proxy_id) = proxy_id {
@@ -1283,10 +1268,6 @@ impl ProfileManager {
       })?;
 
     crate::sync::queue_profile_sync_if_eligible(&profile);
-
-    // Same reason as the proxy path: a VPN is the profile's exit node too, and
-    // the server only knows what this machine last told it.
-    crate::cookie_bot::report_profile_state(&profile);
 
     // Auto-enable sync for the new VPN if profile has sync enabled.
     if profile.is_sync_enabled() {
@@ -1946,15 +1927,6 @@ pub async fn create_browser_profile_new(
   dns_blocklist: Option<String>,
   launch_hook: Option<String>,
 ) -> Result<BrowserProfile, String> {
-  let fingerprint_os = wayfern_config.as_ref().and_then(|c| c.os.as_deref());
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(fingerprint_os)
-    .await
-  {
-    return Err(serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string());
-  }
-
   // A dead/unreachable proxy or VPN (or a 402 from an expired proxy
   // subscription) cancels creation with a translatable error.
   crate::validate_profile_network(proxy_id.as_deref(), vpn_id.as_deref()).await?;
@@ -1984,21 +1956,6 @@ pub async fn update_wayfern_config(
   profile_id: String,
   config: WayfernConfig,
 ) -> Result<(), String> {
-  if config.fingerprint.is_some()
-    && !crate::cloud_auth::CLOUD_AUTH
-      .can_use_cross_os_fingerprints()
-      .await
-  {
-    return Err(serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string());
-  }
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(config.os.as_deref())
-    .await
-  {
-    return Err(serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string());
-  }
-
   let profile_manager = ProfileManager::instance();
   profile_manager
     .update_wayfern_config(app_handle, &profile_id, config)

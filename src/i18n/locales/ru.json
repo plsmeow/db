@@ -166,7 +166,6 @@
       "passwordSaved": "Пароль шифрования установлен",
       "passwordMismatch": "Пароли не совпадают",
       "passwordTooShort": "Пароль должен содержать не менее 8 символов",
-      "requiresProOrOwner": "Шифрование профилей доступно для пользователей Pro и владельцев команд.",
       "validatePassword": "Проверить",
       "validateDialog": {
         "title": "Проверка пароля шифрования",
@@ -175,15 +174,6 @@
         "matchToast": "Пароль верен",
         "mismatchToast": "Пароль не совпадает"
       }
-    },
-    "commercial": {
-      "title": "Коммерческая лицензия",
-      "trialActive": "Пробный период: осталось {{days}} дней, {{hours}} часов",
-      "trialActiveDescription": "Коммерческое использование бесплатно в течение пробного периода. После его окончания все функции продолжают работать — личное использование остаётся бесплатным, и только для коммерческого использования потребуется лицензия.",
-      "trialExpired": "Пробный период истёк",
-      "trialExpiredDescription": "Личное использование остаётся бесплатным. Для коммерческого использования требуется лицензия.",
-      "subscriptionActive": "Подписка активна — план {{plan}}",
-      "subscriptionActiveDescription": "Ваша подписка на Donut Browser активна. Коммерческое использование лицензировано на срок действия плана."
     },
     "advanced": {
       "title": "Дополнительно",
@@ -195,8 +185,6 @@
       "copyLogsSuccess": "Логи скопированы в буфер обмена",
       "copyLogsDescription": "Копирует отредактированный набор последних логов (до 5 МБ). Проверьте его перед отправкой: редактирование не может выявить все виды персональных данных."
     },
-    "disableAutoUpdates": "Отключить автообновление приложения",
-    "disableAutoUpdatesDescription": "Запретить автоматическую проверку и установку обновлений Donut Browser. Обновления браузеров не затрагиваются.",
     "keepDecryptedProfilesInRam": "Хранить расшифрованные профили в ОЗУ",
     "keepDecryptedProfilesInRamDescription": "Сохранять расшифрованную копию защищённых паролем профилей в ОЗУ между запусками для ускорения старта. Копия на диске в любом случае остаётся зашифрованной.",
     "privacy": {
@@ -287,7 +275,6 @@
       "stopLeader": "Остановить этот профиль и всех его последователей",
       "stopFollower": "Повторяет действия {{leaderName}}",
       "desyncedTooltip": "Синхронизация не удалась на {{url}}",
-      "paidFeature": "Синхронизатор — платная функция",
       "wayfernOnly": "Синхронизировать можно только профили Wayfern",
       "selectFollowers": "Выберите профили-последователи",
       "selectFollowersDesc": "Выберите профили, которые будут повторять действия профиля-лидера. Можно выбрать только остановленные профили Wayfern.",
@@ -324,8 +311,7 @@
       "assignExtensionGroup": "Назначить группу расширений",
       "copyCookies": "Копировать cookies",
       "runSelected": "Запустить выбранные",
-      "stopSelected": "Остановить выбранные",
-      "proRequired": "Для массового запуска/остановки требуется план Pro"
+      "stopSelected": "Остановить выбранные"
     },
     "passwordProtectedBadge": "Защищено паролем",
     "launchHook": {
@@ -654,40 +640,6 @@
       "error": "Ошибка синхронизации"
     },
     "description": "Подключитесь к серверу синхронизации для синхронизации профилей, прокси и групп между устройствами.",
-    "cloud": {
-      "tabLabel": "Облако",
-      "selfHostedTabLabel": "Свой сервер",
-      "email": "Электронная почта",
-      "deviceLinkInstructions": "Нажмите «Войти», чтобы открыть страницу входа в браузере. После входа скопируйте показанный код и вставьте его ниже.",
-      "openLogin": "Войти",
-      "linkCodeLabel": "Код входа",
-      "linkCodePlaceholder": "Вставьте код с сайта",
-      "signInTitle": "Войти",
-      "verifyAndLogin": "Подтвердить и Войти",
-      "loggingIn": "Вход...",
-      "connected": "Подключено",
-      "plan": "Тариф",
-      "profiles": "Профили",
-      "profileUsage": "{{used}} / {{limit}}",
-      "manageAccount": "Управление аккаунтом",
-      "logout": "Выйти",
-      "logoutConfirm": "Вы уверены, что хотите выйти? Облачная синхронизация будет остановлена.",
-      "loginSuccess": "Вход выполнен успешно!",
-      "logoutSuccess": "Выход выполнен успешно."
-    },
-    "team": {
-      "title": "Команда",
-      "name": "Название команды",
-      "role": "Роль",
-      "roleOwner": "Владелец",
-      "roleAdmin": "Администратор",
-      "roleMember": "Участник",
-      "manageOnWeb": "Управление командой в веб-панели",
-      "profileLocked": "Используется {{email}}",
-      "profileLockedShort": "Используется",
-      "cannotLaunchLocked": "Невозможно запустить — профиль используется {{email}}",
-      "createdBy": "Создано {{email}}"
-    },
     "disabled": "Отключена",
     "toast": {
       "profileSynced": "Профиль '{{name}}' успешно синхронизирован",
@@ -880,8 +832,7 @@
       "selectFile": "Выбрать файл",
       "preview": "Найдено {{count}} cookies",
       "success": "Успешно импортировано {{imported}} cookies ({{replaced}} заменено)",
-      "error": "Ошибка импорта cookies",
-      "proFeature": "Импорт cookies — функция Pro"
+      "error": "Ошибка импорта cookies"
     },
     "export": {
       "title": "Экспорт Cookies",
@@ -1087,7 +1038,6 @@
     "productSub": "Подверсия продукта",
     "brand": "Бренд",
     "brandVersion": "Версия бренда",
-    "proFeature": "Это функция Pro",
     "generateFingerprint": "Сгенерировать отпечаток",
     "refreshFingerprint": "Обновить отпечаток",
     "canvasNoiseSeedPlaceholder": "Введите строку-семя для отпечатка canvas",
@@ -1227,9 +1177,7 @@
       "cannotWhileRunning": "Остановите профиль перед сменой пароля."
     },
     "fingerprint": {
-      "notSupported": "Редактирование отпечатков доступно только для профилей Wayfern.",
-      "lockedTitle": "Просмотр и редактирование отпечатка — функция Pro",
-      "lockedDescription": "Информация о вашем устройстве защищена в каждом профиле. Для просмотра и редактирования отпечатка профиля требуется активный платный план."
+      "notSupported": "Редактирование отпечатков доступно только для профилей Wayfern."
     },
     "syncStatusValue": {
       "waiting": "Ожидание",
@@ -1252,7 +1200,6 @@
     "extensionsTab": "Расширения",
     "groupsTab": "Группы",
     "managedNotice": "Расширения, управляемые здесь, заменят все вручную установленные расширения в профилях при запуске.",
-    "proRequired": "Управление расширениями — функция Pro",
     "empty": "Расширения ещё не загружены.",
     "noGroups": "Группы расширений ещё не созданы.",
     "createGroup": "Создать группу",
@@ -1333,14 +1280,6 @@
       "folderLabel": "Папка",
       "linkedTooltip": "Загружается прямо из {{path}}"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "Редактирование отпечатка — функция Pro",
-    "cookieCopyLocked": "Копирование cookies — функция Pro",
-    "cookieImportLocked": "Импорт cookies — функция Pro",
-    "cookieExportLocked": "Экспорт cookies — функция Pro",
-    "cookieManagementLocked": "Управление cookies — функция Pro"
   },
   "dnsBlocklist": {
     "title": "Список блокировки DNS",
@@ -1631,14 +1570,6 @@
     "acceptFailed": "Не удалось принять условия",
     "tryAgain": "Пожалуйста, попробуйте снова"
   },
-  "commercialTrial": {
-    "title": "Срок коммерческой пробной версии истёк",
-    "description": "Ваш 2-недельный коммерческий пробный период закончился.",
-    "body": "Если вы используете Donut Browser в коммерческих целях, для продолжения вам нужно приобрести коммерческую лицензию. Вы можете продолжать использовать его бесплатно для личных целей.",
-    "understandButton": "Понятно",
-    "failed": "Не удалось сохранить подтверждение",
-    "tryAgain": "Пожалуйста, попробуйте снова"
-  },
   "permissionDialog": {
     "titleMicrophone": "Требуется доступ к микрофону",
     "titleCamera": "Требуется доступ к камере",
@@ -1745,20 +1676,6 @@
   "dataTableActionBar": {
     "selected": "Выбрано: {{count}}",
     "clearSelection": "Очистить выбор"
-  },
-  "appUpdate": {
-    "toast": {
-      "updateFailed": "Не удалось обновить Donut Browser",
-      "restartFailed": "Не удалось перезапустить",
-      "updateReady": "Обновление готово, перезапустите для применения",
-      "manualDownloadRequired": "Требуется ручная загрузка",
-      "restartNow": "Перезапустить сейчас",
-      "viewRelease": "Посмотреть релиз",
-      "later": "Позже",
-      "uploading": "Загрузка",
-      "downloading": "Скачивание",
-      "startingUpdate": "Запуск обновления..."
-    }
   },
   "browserDownload": {
     "toast": {
@@ -1895,8 +1812,6 @@
     "invalidLaunchHookUrl": "Неверный URL хука запуска. Используйте полный URL http:// или https://.",
     "cookieDbLocked": "Не удалось прочитать куки — база данных заблокирована. Закройте браузер и попробуйте снова.",
     "cookieDbUnavailable": "Не удалось прочитать куки — хранилище куки недоступно.",
-    "selfHostedRequiresLogout": "Выйдите из аккаунта Donut, прежде чем настраивать собственный сервер.",
-    "fingerprintRequiresPro": "Для просмотра или редактирования отпечатка требуется активный платный план. Защита включена во все планы.",
     "proxyNotWorking": "Выбранный прокси не работает, поэтому профиль не создан.",
     "proxyPaymentRequired": "Выбранный прокси требует оплаты (402) — возможно, его подписка истекла — поэтому профиль не создан.",
     "vpnNotWorking": "Выбранный VPN не работает, поэтому профиль не создан.",
@@ -1934,42 +1849,7 @@
     "xrayUnavailable": "Xray-core недоступен в этой системе.",
     "xrayUnsupportedOs": "Для VLESS требуется macOS 12 или новее.",
     "xrayStartFailed": "Не удалось запустить Xray-core.",
-    "cloudNotSignedIn": "Войдите в аккаунт Donut Browser, чтобы использовать эту функцию.",
-    "cloudUnreachable": "Не удалось связаться с серверами Donut Browser. Проверьте подключение и попробуйте снова.",
-    "cloudRequestFailed": "Запрос не удался. Попробуйте ещё раз через минуту.",
-    "remoteRateLimited": "Слишком много запросов. Подождите немного и попробуйте снова.",
-    "remoteNoCapacity": "Сейчас нет свободных удалённых машин. Попробуйте через несколько минут.",
-    "remoteNotEntitled": "Ваш тариф не включает удалённый запуск.",
-    "remoteInteractiveNotEntitled": "В вашем тарифе удалённые часы доступны только для Cookie Bot, но не для интерактивных удалённых сессий.",
-    "remoteRequiresRemoteExitNode": "Прокси этого профиля работает только на этом компьютере (например, 127.0.0.1 или адрес локальной сети). Удалённые сессии выполняются на наших хостах, поэтому нужен прокси с публичным адресом.",
-    "remoteSessionRefused": "Удалённая машина отклонила эту сессию.",
-    "remoteSessionNotFound": "Этой удалённой сессии больше не существует.",
-    "remoteSessionConflict": "Этот профиль уже открыт в другом месте.",
-    "remoteSyncInProgress": "Профиль ещё загружается в облачную синхронизацию. Дождитесь окончания и попробуйте снова.",
-    "remoteHoursExhausted": "Вы израсходовали все {{used}} из {{granted}} удалённых часов в этом месяце.",
-    "notTeamMember": "Вы не состоите в команде.",
-    "cookieBotNotEntitled": "Ваш тариф не включает Cookie Bot.",
-    "cookieBotNotEnrolled": "Этот профиль ещё не настроен для Cookie Bot.",
-    "cookieBotScheduleConflict": "{{email}} уже прогревает этот профиль в {{time}}.",
-    "cookieBotRunInProgress": "Для этого профиля уже выполняется запуск.",
-    "cookieBotRunNotFound": "Этого запуска больше не существует.",
-    "cookieBotInvalidSchedule": "Это расписание некорректно. Проверьте время, дни и длительность.",
-    "cookieBotInvalidTimezone": "{{timezone}} — часовой пояс, который сервер не распознаёт.",
-    "cookieBotInvalidPeriod": "Некорректный период. Укажите месяц, например 2026-08.",
-    "cookieBotSiteLimit": "Укажите от {{min}} до {{max}} сайтов, каждый — полным адресом http или https.",
-    "cookieBotRequiresCloudSync": "Сначала включите облачную синхронизацию для этого профиля: иначе удалённая машина не сможет его получить.",
-    "cookieBotEncryptedSyncUnsupported": "Этот профиль использует сквозное шифрование синхронизации, которое удалённая машина не может расшифровать. Переключите его на обычную синхронизацию.",
-    "cookieBotUnknownPlatform": "Для этого профиля не записана операционная система, поэтому подобрать машину невозможно.",
-    "cookieBotUnsupportedPlatform": "Cookie Bot не может запускать профили {{platform}}. Поддерживаются только профили Windows и macOS.",
-    "cookieBotRequiresExitNode": "Сначала назначьте прокси или VPN. Без них трафик пойдёт с адреса дата-центра, а это вредит репутации профиля.",
-    "cookieBotRequiresRemoteExitNode": "Прокси этого профиля работает только на этом компьютере (например, 127.0.0.1 или адрес локальной сети). Cookie Bot выполняется на наших хостах, поэтому нужен прокси с публичным адресом.",
     "unknownCode": "Что-то пошло не так: {{code}}",
-    "cookieBotTouchFingerprintUnsupported": "Этот профиль выдаёт себя за сенсорное устройство, которым бот управлять не может. Используйте настольный отпечаток.",
-    "profileRunningRemotely": "Этот профиль запущен на удалённой машине. Сначала остановите удалённый сеанс.",
-    "profileRemoteSyncPending": "Удалённый сеанс только что завершился. Дождитесь загрузки его изменений, прежде чем открывать профиль здесь.",
-    "profileLockedByMember": "Этот профиль используется пользователем {{email}}.",
-    "profileLockedElsewhere": "Этот профиль используется на другом устройстве.",
-    "profileLockUnavailable": "Не удалось проверить, используется ли профиль где-то ещё. Проверьте подключение и попробуйте снова.",
     "fingerprintExitMismatch": "Выходной узел прокси не совпадает с отпечатком этого профиля.",
     "launchConsentExpired": "Это подтверждение больше не действует. Запустите профиль ещё раз.",
     "vpnWorkerStartFailed": "Не удалось запустить VPN-подключение: {{detail}}",
@@ -2009,10 +1889,7 @@
       "aboutHint": "Версия и сведения о приложении"
     },
     "network": "Сеть",
-    "integrations": "Интеграции",
-    "account": "Аккаунт",
-    "cookieBot": "Cookie Bot",
-    "cookieBotRunning": "Cookie Bot — сейчас работает"
+    "integrations": "Интеграции"
   },
   "pageTitle": {
     "proxies": "Сеть",
@@ -2021,10 +1898,8 @@
     "vpns": "Сеть",
     "settings": "Настройки",
     "integrations": "Интеграции",
-    "account": "Аккаунт",
     "import": "Импорт профиля",
-    "shortcuts": "Сочетания клавиш",
-    "cookieBot": "Cookie Bot"
+    "shortcuts": "Сочетания клавиш"
   },
   "encryption": {
     "required": {
@@ -2050,39 +1925,17 @@
     }
   },
   "account": {
-    "refreshed": "Аккаунт обновлён",
-    "loggedOut": "Вы вышли",
-    "signedOut": "Не выполнен вход",
-    "signedOutDescription": "Войдите, чтобы включить облачную синхронизацию, зашифрованные профили и командные функции.",
-    "plan": "Тариф: {{plan}} · {{period}}",
-    "refresh": "Обновить",
-    "logout": "Выйти",
-    "signIn": "Войти",
-    "fields": {
-      "plan": "Тариф",
-      "status": "Статус",
-      "teamRole": "Роль в команде",
-      "period": "Период",
-      "device": "Устройство"
-    },
     "tabs": {
-      "account": "Аккаунт",
-      "selfHosted": "Свой сервер",
-      "teamUsage": "Использование командой"
+      "selfHosted": "Свой сервер"
     },
     "selfHosted": {
       "title": "Свой сервер синхронизации",
       "description": "Подключите Donut к собственному серверу donut-sync, чтобы синхронизировать профили, прокси, группы и расширения без использования облака.",
-      "disabledWhileLoggedIn": "Свой сервер синхронизации недоступен, пока вы вошли в аккаунт Donut. Выйдите из аккаунта, чтобы использовать собственный сервер.",
       "connectionStatus": "Соединение:",
       "statusUnknown": "Не проверено",
       "testConnection": "Проверить соединение",
       "disconnect": "Отключить"
-    },
-    "deviceOrdinal": "{{ordinal}} из {{count}}",
-    "automationPrimaryOnly": "Автоматизация браузера работает только на вашем основном устройстве (Устройство 1). Выйдите из аккаунта на нём, чтобы использовать её здесь.",
-    "automationActiveHere": "Автоматизация браузера активна на этом устройстве.",
-    "viewTeamUsage": "Посмотреть использование командой"
+    }
   },
   "shortcutsPage": {
     "title": "Сочетания клавиш",
@@ -2114,9 +1967,7 @@
     "goExtensions": "Перейти к Расширениям",
     "goGroups": "Перейти к Группам",
     "goIntegrations": "Перейти к Интеграциям",
-    "goAccount": "Перейти к Аккаунту",
-    "goSettings": "Перейти к Настройкам",
-    "goCookieBot": "Cookie Bot"
+    "goSettings": "Перейти к Настройкам"
   },
   "closeConfirm": {
     "title": "Закрыть Donut Browser?",
@@ -2193,21 +2044,7 @@
         "groups": "Группы профилей",
         "cookies": "Импорт и экспорт cookie"
       }
-    },
-    "license": {
-      "title": "Лицензия",
-      "body": "Donut Browser имеет открытый исходный код и бесплатен в использовании.",
-      "agree": "Понятно",
-      "personalTitle": "Личное использование",
-      "personalDesc": "Бесплатно навсегда.",
-      "commercialTitle": "Коммерческое использование",
-      "trialBadge": "2 недели бесплатно",
-      "commercialDesc": "Бесплатно в течение 2-недельного ознакомительного периода. После этого требуется платный план, что помогает поддерживать и развивать проект."
     }
-  },
-  "wayfernBlocked": {
-    "title": "Автоматизация браузера приостановлена",
-    "description": "Автоматизация браузера работает только на одном устройстве одновременно, и сейчас её использует другое устройство с активным входом. Выйдите из аккаунта на нём и запустите профиль снова."
   },
   "wayfernConfigDialog": {
     "titleView": "Просмотр настроек отпечатка - {{name}} ({{browser}})",
@@ -2243,367 +2080,6 @@
     "matchToProxy": "Подогнать отпечаток под прокси",
     "matching": "Подгонка…",
     "matchSuccess": "Отпечаток обновлён под прокси. Перезапустите профиль, чтобы применить."
-  },
-  "cookieBot": {
-    "title": "Cookie Bot",
-    "description": "Ночной прогрев профилей на удалённой машине.",
-    "tabs": {
-      "overview": "Обзор",
-      "schedule": "Расписание",
-      "activity": "Активность",
-      "team": "Команда"
-    },
-    "locked": {
-      "title": "Cookie Bot",
-      "hint": "Cookie Bot прогревает ваши профили ночью на удалённой машине, чтобы они сохраняли cookies и историю, пока ваш компьютер выключен."
-    },
-    "empty": {
-      "title": "Нет подключённых профилей",
-      "hint": "Выберите профиль, и бот будет прогревать его ночью на удалённой машине. Ваш компьютер может быть выключен.",
-      "cta": "Подключить профиль"
-    },
-    "tonight": {
-      "label": "Сегодня ночью",
-      "nextRun": "Следующий запуск в {{time}}",
-      "dueCount_one": "{{count}} профиль в очереди",
-      "dueCount_few": "{{count}} профиля в очереди",
-      "dueCount_other": "{{count}} профилей в очереди",
-      "dueCount_many": "{{count}} профилей в очереди",
-      "nothingScheduled": "Ничего не запланировано"
-    },
-    "lastDay": {
-      "label": "Последние 24 часа",
-      "none": "Запусков пока нет",
-      "ran_one": "{{count}} выполнен",
-      "ran_few": "{{count}} выполнено",
-      "ran_other": "{{count}} выполнено",
-      "ran_many": "{{count}} выполнено",
-      "partial_one": "{{count}} частичный",
-      "partial_few": "{{count}} частичных",
-      "partial_other": "{{count}} частичных",
-      "partial_many": "{{count}} частичных",
-      "failed_one": "{{count}} с ошибкой",
-      "failed_few": "{{count}} с ошибками",
-      "failed_other": "{{count}} с ошибками",
-      "failed_many": "{{count}} с ошибками"
-    },
-    "chart": {
-      "machineTime": "Машинное время за ночь",
-      "minutes": "{{minutes}} мин"
-    },
-    "hours": {
-      "label": "Удалённые часы",
-      "remaining": "Осталось {{remaining}} ч из {{total}}",
-      "remainingOf": "из {{total}} ч",
-      "used": "Использовано {{used}} из {{total}} ч",
-      "resets": "Обновление {{date}}",
-      "exhausted": "Удалённые часы закончились. Расписания остаются подключёнными и возобновятся в следующем цикле.",
-      "exhaustedOn": "Удалённые часы закончились. Расписания остаются подключёнными и возобновятся {{date}}.",
-      "estimate": "Около {{hours}} ч в неделю · осталось {{remaining}} ч в этом цикле",
-      "estimateOverBudget": "Нужно около {{hours}} ч в неделю — осталось всего {{remaining}} ч",
-      "estimateOnly": "Около {{hours}} ч в неделю"
-    },
-    "enrolled": {
-      "columnProfile": "Профиль",
-      "columnCadence": "Периодичность",
-      "columnTime": "Время",
-      "columnNextRun": "Следующий запуск",
-      "columnLastRun": "Последний запуск",
-      "enrolProfiles": "Подключить профили",
-      "edit": "Изменить расписание",
-      "neverRun": "Никогда",
-      "pausedNoHours": "Приостановлено — часы закончились",
-      "profileMissing": "Этого профиля нет на этом компьютере."
-    },
-    "schedule": {
-      "empty": "Пока ничего не запланировано.",
-      "quietHours_one": "{{count}} свободный час",
-      "quietHours_few": "{{count}} свободных часа",
-      "quietHours_other": "{{count}} свободных часов",
-      "quietHours_many": "{{count}} свободных часов",
-      "crowded_one": "{{count}} профиль стартует одновременно",
-      "crowded_few": "{{count}} профиля стартуют одновременно",
-      "crowded_other": "{{count}} профилей стартуют одновременно",
-      "crowded_many": "{{count}} профилей стартуют одновременно",
-      "unenrol": "Убрать из Cookie Bot",
-      "unenrolTitle": "Убрать {{name}} из Cookie Bot?",
-      "unenrolDescription": "Прогрев прекратится уже этой ночью. Прошлые запуски останутся во вкладке «Активность».",
-      "unenrolled": "Убрано из Cookie Bot"
-    },
-    "status": {
-      "provisioning": "Готовим машину",
-      "ready": "Загружаем профиль",
-      "warming": "Прогрев",
-      "finished": "Завершение",
-      "failed": "Сбой"
-    },
-    "runStatus": {
-      "pending": "В очереди",
-      "running": "Выполняется",
-      "succeeded": "Завершён",
-      "partial": "Частично",
-      "failed": "Ошибка",
-      "skipped": "Пропущен",
-      "cancelled": "Остановлен"
-    },
-    "running": {
-      "label": "Сейчас выполняется",
-      "more": "+{{count}} ещё",
-      "stop": "Остановить запуск",
-      "stopped": "Запуск остановлен"
-    },
-    "live": {
-      "idle": "Сейчас ничего не выполняется",
-      "streamOffline": "Обновления в реальном времени недоступны",
-      "streamOfflineDetail": "Обновления в реальном времени недоступны — переподключаемся. Данные ниже могут быть устаревшими.",
-      "unnamedSession": "Удалённая сессия",
-      "notStartedYet": "Машина ещё не сообщила время начала.",
-      "sitesProgress": "{{visited}} из {{total}} сайтов",
-      "sitesUnknown": "Сайты ещё не переданы",
-      "consentHandled_one": "Обработан {{count}} баннер согласия",
-      "consentHandled_few": "Обработано {{count}} баннера согласия",
-      "consentHandled_other": "Обработано {{count}} баннеров согласия",
-      "consentHandled_many": "Обработано {{count}} баннеров согласия",
-      "consentUnknown": "Баннеры согласия ещё не переданы",
-      "billed": "Начислено {{duration}}",
-      "billedUnknown": "Оплачиваемое время ещё не передано",
-      "chunk": "Часть {{index}} из {{total}}"
-    },
-    "history": {
-      "title": "Запуски",
-      "allProfiles": "Все профили",
-      "searchPlaceholder": "Поиск профилей…",
-      "filterAll": "Все запуски",
-      "filterComplete": "Завершённые",
-      "filterPartial": "Частичные",
-      "filterFailed": "С ошибкой",
-      "columnStarted": "Начало",
-      "columnProfile": "Профиль",
-      "columnDuration": "Длительность",
-      "columnSites": "Сайты",
-      "columnStatus": "Статус",
-      "columnOperator": "Оператор",
-      "empty": "Запусков пока нет.",
-      "noMatch": "Нет запусков по этому фильтру.",
-      "unknownProfile": "Неизвестный профиль",
-      "outcome": "Причина: {{reason}}",
-      "sitesVisited": "{{visited}}/{{total}}",
-      "sitesFailed_one": "{{count}} сайт недоступен",
-      "sitesFailed_few": "{{count}} сайта недоступно",
-      "sitesFailed_other": "{{count}} сайтов недоступно",
-      "sitesFailed_many": "{{count}} сайтов недоступно",
-      "consentHandled_one": "Обработан {{count}} баннер согласия",
-      "consentHandled_few": "Обработано {{count}} баннера согласия",
-      "consentHandled_other": "Обработано {{count}} баннеров согласия",
-      "consentHandled_many": "Обработано {{count}} баннеров согласия",
-      "sitesUnknown": "Нет данных"
-    },
-    "duration": {
-      "hm": "{{hours}} ч {{minutes}} мин",
-      "ms": "{{minutes}} мин {{seconds}} с",
-      "s": "{{seconds}} с"
-    },
-    "picker": {
-      "title": "Подключить профили",
-      "description": "Выберите профили, которые бот будет прогревать ночью.",
-      "searchPlaceholder": "Поиск профилей…",
-      "noProfiles": "Подходящих профилей нет.",
-      "alreadyEnrolled": "Подключён",
-      "continue_one": "Продолжить с {{count}}",
-      "continue_few": "Продолжить с {{count}}",
-      "continue_other": "Продолжить с {{count}}",
-      "continue_many": "Продолжить с {{count}}"
-    },
-    "enrol": {
-      "titleOne": "Подключить {{name}}",
-      "titleCount_one": "Подключить {{count}} профиль",
-      "titleCount_few": "Подключить {{count}} профиля",
-      "titleCount_other": "Подключить {{count}} профилей",
-      "titleCount_many": "Подключить {{count}} профилей",
-      "editTitle": "Изменить расписание",
-      "description": "Бот открывает профиль на удалённой машине и просматривает указанные вами сайты. Ваш компьютер может быть выключен.",
-      "summaryNightly": "Запускается каждую ночь в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryWeeknights": "Запускается с понедельника по пятницу в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryAlternate": "Запускается через ночь в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryCustom_one": "Запускается {{count}} ночь в неделю в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryCustom_few": "Запускается {{count}} ночи в неделю в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryCustom_other": "Запускается {{count}} ночей в неделю в {{time}}, не дольше {{minutes}} мин за раз.",
-      "summaryCustom_many": "Запускается {{count}} ночей в неделю в {{time}}, не дольше {{minutes}} мин за раз.",
-      "confirm": "Подключить на эту ночь",
-      "confirmSome": "Подключить {{eligible}} из {{total}} на эту ночь",
-      "fixFirst": "Сначала исправьте это",
-      "saving": "Подключаем…",
-      "saved": "Расписание сохранено",
-      "enrolled_one": "Подключён {{count}} профиль",
-      "enrolled_few": "Подключено {{count}} профиля",
-      "enrolled_other": "Подключено {{count}} профилей",
-      "enrolled_many": "Подключено {{count}} профилей",
-      "adjust": "Настроить расписание",
-      "cadenceLabel": "Периодичность",
-      "cadenceNightly": "Каждую ночь",
-      "cadenceWeeknights": "По будним ночам",
-      "cadenceAlternate": "Через ночь",
-      "cadenceCustom_one": "{{count}} ночь в неделю",
-      "cadenceCustom_few": "{{count}} ночи в неделю",
-      "cadenceCustom_other": "{{count}} ночей в неделю",
-      "cadenceCustom_many": "{{count}} ночей в неделю",
-      "timeLabel": "Время начала",
-      "timeHint": "По часовому поясу отпечатка каждого профиля.",
-      "maxMinutesLabel": "Максимум минут",
-      "intensityLabel": "Глубина",
-      "sitesLabel": "Сайты",
-      "sitesPlaceholder": "По одному адресу в строке",
-      "sitesHint_one": "{{count}} сайт. Посещаются только указанные здесь страницы.",
-      "sitesHint_few": "{{count}} сайта. Посещаются только указанные здесь страницы.",
-      "sitesHint_other": "{{count}} сайтов. Посещаются только указанные здесь страницы.",
-      "sitesHint_many": "{{count}} сайтов. Посещаются только указанные здесь страницы.",
-      "sitesTooMany": "Не более {{max}} сайтов.",
-      "presetsUnavailable": "Не удалось загрузить пресеты глубины. Попробуйте ещё раз через минуту.",
-      "confirmBulkTitle_one": "Подключить {{count}} профиль к Cookie Bot?",
-      "confirmBulkTitle_few": "Подключить {{count}} профиля к Cookie Bot?",
-      "confirmBulkTitle_other": "Подключить {{count}} профилей к Cookie Bot?",
-      "confirmBulkTitle_many": "Подключить {{count}} профилей к Cookie Bot?",
-      "confirmBulkDescription_one": "Это резервирует ночной запуск за счёт общих удалённых часов. Время и сайты вы выберете дальше.",
-      "confirmBulkDescription_few": "Это резервирует {{count}} ночных запуска за счёт общих удалённых часов. Время и сайты вы выберете дальше.",
-      "confirmBulkDescription_other": "Это резервирует {{count}} ночных запусков за счёт общих удалённых часов. Время и сайты вы выберете дальше.",
-      "confirmBulkDescription_many": "Это резервирует {{count}} ночных запусков за счёт общих удалённых часов. Время и сайты вы выберете дальше.",
-      "confirmBulkButton_one": "Продолжить с {{count}} профилем",
-      "confirmBulkButton_few": "Продолжить с {{count}} профилями",
-      "confirmBulkButton_other": "Продолжить с {{count}} профилями",
-      "confirmBulkButton_many": "Продолжить с {{count}} профилями",
-      "sitesRequired": "Добавьте хотя бы один сайт.",
-      "addSitesFirst": "Сначала добавьте сайт",
-      "presetsMissing": "Пресеты глубины недоступны",
-      "sourceOwn": "Свой список",
-      "sourceCurated": "Подборки",
-      "sourceSaved": "Сохранённые",
-      "curatedEmpty": "Сейчас нет доступных подборок.",
-      "curatedNote": "Подборка, которую мы поддерживаем в актуальном состоянии. Каждый профиль берёт из неё свою выборку, поэтому два профиля не обходят один и тот же набор — именно это не даёт списку стать приметой. Адреса остаются на нашей стороне.",
-      "savedEmpty": "Пока ничего не сохранено. Введите список в разделе «Свой список» и сохраните его оттуда.",
-      "savedNote": "Сайты копируются в расписание при сохранении, поэтому правка списка позже не меняет уже созданные расписания.",
-      "savedUnavailable": "Не удалось загрузить сохранённые списки.",
-      "saveAsList": "Сохранить как список",
-      "listNamePlaceholder": "Название списка",
-      "listSaved": "Список сохранён",
-      "listRenamed": "Список переименован",
-      "listDeleted": "Список удалён",
-      "listRename": "Переименовать",
-      "listDeleteConfirm": "Удалить?",
-      "templateMissing": "Этого сохранённого списка больше нет. Выберите другой.",
-      "templateNameTaken": "Список с таким названием уже есть.",
-      "templateNameInvalid": "Название списка — не длиннее {{max}} символов.",
-      "calendarLabel": "Когда запускать",
-      "daysLabel": "Дни недели",
-      "addSlot": "Добавить время",
-      "slotsFull": "Не больше {{max}} времён запуска.",
-      "removeSlot": "Убрать это время",
-      "pickListFirst": "Сначала выберите список",
-      "finishCalendarFirst": "Сначала заполните расписание",
-      "duplicateSlot": "Две строки повторяют одни и те же дни и время",
-      "listSites_one": "{{count}} сайт",
-      "listSites_few": "{{count}} сайта",
-      "listSites_other": "{{count}} сайтов",
-      "listSites_many": "{{count}} сайтов",
-      "summarySlots_one": "Запускается {{count}} раз в неделю, не дольше {{minutes}} мин за раз.",
-      "summarySlots_few": "Запускается {{count}} раза в неделю, не дольше {{minutes}} мин за раз.",
-      "summarySlots_other": "Запускается {{count}} раз в неделю, не дольше {{minutes}} мин за раз.",
-      "summarySlots_many": "Запускается {{count}} раз в неделю, не дольше {{minutes}} мин за раз.",
-      "templateNameInvalidNoMax": "Это имя нельзя использовать для сохранённого списка."
-    },
-    "preset": {
-      "light": "Лёгкая",
-      "balanced": "Стандартная",
-      "deep": "Глубокая"
-    },
-    "template": {
-      "lowIntentPurchaser": "Покупатель с низким намерением",
-      "lowIntentPurchaserHint": "Позиционирует профиль как чувствительного к цене покупателя: сравнение цен, купоны, кэшбэк и перепродажа, а к магазинам — через агрегаторы, а не напрямую."
-    },
-    "preflight": {
-      "ineligible_one": "{{count}} профиль нельзя запустить удалённо",
-      "ineligible_few": "{{count}} профиля нельзя запустить удалённо",
-      "ineligible_other": "{{count}} профилей нельзя запустить удалённо",
-      "ineligible_many": "{{count}} профилей нельзя запустить удалённо",
-      "reasonSync": "Синхронизация отключена",
-      "reasonEncrypted": "Сквозное шифрование",
-      "reasonNoFingerprint": "Операционная система не записана",
-      "reasonCrossOs": "Создан для {{os}} — подходящей удалённой машины нет",
-      "reasonNoExitNode": "Нет прокси или VPN",
-      "fixSync": "Включить синхронизацию",
-      "fixEncrypted": "Открыть настройки синхронизации",
-      "fixProxy": "Назначить прокси",
-      "fixFailed": "Не удалось применить это исправление.",
-      "exitNodeHint": "Без прокси или VPN трафик выходит с собственного адреса дата-центра нашего парка машин. Часы трафика из хостинговой сети вредят репутации профиля сильнее, чем полный отказ от прогрева."
-    },
-    "conflict": {
-      "title": "{{email}} уже прогревает этот профиль в {{time}}",
-      "detail": "Два расписания на одном профиле расходуют часы дважды и могут столкнуться прямо во время запуска.",
-      "keepTheirs": "Оставить их расписание",
-      "replace": "Заменить моим",
-      "replaceForbidden": "Менять чужое расписание может только владелец команды или администратор.",
-      "askThem": "Скопировать {{email}}",
-      "emailCopied": "Адрес скопирован",
-      "copyFailed": "Не удалось скопировать адрес."
-    },
-    "actionBar": {
-      "enrol": "Подключить к Cookie Bot",
-      "proRequired": "Для Cookie Bot нужен платный тариф",
-      "noneEligible": "Ни один из выбранных профилей нельзя прогреть удалённо"
-    },
-    "actions": {
-      "enrol": "Подключить к Cookie Bot",
-      "editSchedule": "Изменить расписание",
-      "runNow": "Запустить сейчас",
-      "runStarted": "Запуск начат",
-      "viewActivity": "Посмотреть активность",
-      "runNotStarted": "Запуск не начался: {{reason}}"
-    },
-    "state": {
-      "enrolled": "Подключён",
-      "notEnrolled": "Не подключён",
-      "paused": "Приостановлен",
-      "summary": "{{cadence}} в {{time}}",
-      "rowMenu": "Параметры Cookie Bot для {{name}}",
-      "blocked": "Не может запуститься: {{reason}}"
-    },
-    "team": {
-      "title": "Использование командой",
-      "pooled_one": "{{used}} из {{total}} ч, {{count}} место",
-      "pooled_few": "{{used}} из {{total}} ч на {{count}} места",
-      "pooled_other": "{{used}} из {{total}} ч на {{count}} мест",
-      "pooled_many": "{{used}} из {{total}} ч на {{count}} мест",
-      "hours": "{{hours}} ч",
-      "legendBot": "Cookie Bot",
-      "legendInteractive": "Интерактивно",
-      "columnMember": "Участник",
-      "columnRuns": "Запуски",
-      "columnHours": "Часы",
-      "columnShare": "Доля",
-      "noActivity": "За этот период удалённых сессий нет.",
-      "soloNote": "Пока показано только ваше использование. Пригласите коллег, чтобы увидеть распределение по участникам.",
-      "runsFailed": "· с ошибкой: {{n}}"
-    },
-    "closeReason": {
-      "stoppedByUser": "Остановлено вручную",
-      "maxDuration": "Достигнут предел времени",
-      "other": "Завершено: {{reason}}"
-    },
-    "outcome": {
-      "notEntitled": "Не входит в ваш тариф",
-      "syncDisabled": "Для этого профиля отключена облачная синхронизация",
-      "encryptedSync": "Сквозное шифрование синхронизации не поддерживается",
-      "proxyRequired": "Не назначены ни прокси, ни VPN",
-      "touchFingerprint": "Сенсорные отпечатки не поддерживаются",
-      "platformUnsupported": "Нет машины с системой этого профиля",
-      "noSites": "Нет сайтов для посещения",
-      "quotaExhausted": "Удалённые часы израсходованы",
-      "profileLocked": "Профиль был открыт в другом месте",
-      "noCapacity": "Свободных машин не было",
-      "managerError": "Флот не смог запустить браузер",
-      "budgetExceeded": "Отведённое на ночь время закончилось",
-      "cancelledByUser": "Остановлено вручную",
-      "unknown": "Неизвестная причина ({{code}})"
-    }
   },
   "prelaunchGate": {
     "titleBlocked": "Запуск заблокирован",

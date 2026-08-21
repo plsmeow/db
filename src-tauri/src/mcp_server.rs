@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::browser::ProxySettings;
 use crate::cdp_target::{CdpError, CdpTarget};
-use crate::cloud_auth::CLOUD_AUTH;
 use crate::group_manager::GROUP_MANAGER;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
@@ -171,27 +170,6 @@ impl McpServer {
 
   pub fn is_running(&self) -> bool {
     self.is_running.load(Ordering::SeqCst)
-  }
-
-  /// Gate an MCP tool on a capability the caller already resolved (e.g.
-  /// `CLOUD_AUTH.can_use_browser_automation().await`). Logs the rejected gate
-  /// with enough state for support to diagnose, without leaking secrets.
-  async fn require_capability(feature: &str, allowed: bool) -> Result<(), McpError> {
-    if !allowed {
-      let summary = match CLOUD_AUTH.get_user().await {
-        Some(state) => format!(
-          "logged_in=true plan={} status={} period={:?}",
-          state.user.plan, state.user.subscription_status, state.user.plan_period,
-        ),
-        None => "logged_in=false".to_string(),
-      };
-      log::warn!("[mcp] Rejected '{feature}' — plan does not include it ({summary})");
-      return Err(McpError {
-        code: -32000,
-        message: format!("{feature} requires a plan that includes this feature"),
-      });
-    }
-    Ok(())
   }
 
   pub fn get_port(&self) -> Option<u16> {
@@ -477,77 +455,9 @@ impl McpServer {
         }
       }
 
-      if Self::is_automation_tool_call(&request) {
-        if let crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } =
-          crate::automation_rate_limiter::check_automation_rate_limit().await
-        {
-          log::warn!(
-            "[mcp] Rejected tools/call: automation rate limit exceeded; retry in {}s",
-            retry_after_secs
-          );
-          return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after_secs.to_string())],
-            "automation request rate limit exceeded",
-          )
-            .into_response();
-        }
-      }
-
       let response = state.server.handle_request(request).await;
       Json(response).into_response()
     }
-  }
-
-  fn is_automation_tool_call(request: &McpRequest) -> bool {
-    if request.method != "tools/call" {
-      return false;
-    }
-
-    let Some(tool_name) = request
-      .params
-      .as_ref()
-      .and_then(|params| params.get("name"))
-      .and_then(|name| name.as_str())
-    else {
-      return false;
-    };
-
-    matches!(
-      tool_name,
-      "run_profile"
-        | "kill_profile"
-        | "batch_run_profiles"
-        | "batch_stop_profiles"
-        | "start_sync_session"
-        | "navigate"
-        | "screenshot"
-        | "evaluate_javascript"
-        | "click_element"
-        | "type_text"
-        | "get_page_content"
-        | "get_page_info"
-        | "get_interactive_elements"
-        | "click_by_index"
-        | "type_by_index"
-        // Starting a bot run leases a remote host for up to two hours and
-        // spends the account's pooled remote-hour budget, which makes it the
-        // most expensive tool here. Cancelling one reaches the same fleet, and
-        // is metered alongside the remote-session stop it mirrors.
-        //
-        // Deliberately absent: set_cookie_bot_schedule and
-        // delete_cookie_bot_schedule. They write one row in Donut cloud and
-        // lease nothing; metering them would throttle an agent enrolling a
-        // fleet of profiles, while the budget that actually guards the
-        // hardware is spent per RUN and enforced server-side.
-        | "run_cookie_bot_now"
-        | "cancel_cookie_bot_run"
-        // Leasing a remote host is the single most expensive action here, and
-        // ending one reaches the same fleet. Both are metered exactly as their
-        // REST equivalents already are.
-        | "run_profile_remote"
-        | "stop_remote_session"
-    )
   }
 
   pub async fn stop(&self) -> Result<(), String> {
@@ -855,7 +765,7 @@ impl McpServer {
       },
       McpTool {
         name: "get_profile_status".to_string(),
-        description: "Check whether a browser profile is running and can be driven. Returns is_running (true when the browser can be driven, wherever it is), location ('local', 'remote' or 'stopped'), is_running_locally, and remote_session_id when it is running on the remote fleet.".to_string(),
+        description: "Check whether a browser profile is running and can be driven. Returns is_running, location ('local' or 'stopped'), is_running_locally, and can_launch_locally.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -1439,30 +1349,6 @@ impl McpServer {
           "required": ["profile_id", "content"]
         }),
       },
-      // Team lock tools
-      McpTool {
-        name: "get_team_locks".to_string(),
-        description: "List all active team profile locks. Requires team plan.".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {},
-          "required": []
-        }),
-      },
-      McpTool {
-        name: "get_team_lock_status".to_string(),
-        description: "Check if a profile is locked by a team member. Requires team plan.".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile to check"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
       // Synchronizer tools
       McpTool {
         name: "start_sync_session".to_string(),
@@ -1760,290 +1646,6 @@ impl McpServer {
           "required": ["profile_id", "index", "text"]
         }),
       },
-      // Remote fleet. An agent that could drive a remote profile but not start
-      // one had to be handed a session by something else — the REST API or the
-      // GUI — which is no use to an MCP client running on its own.
-      McpTool {
-        name: "run_profile_remote".to_string(),
-        description: "Start this profile on a remote host of its own operating system. The profile must have Regular cloud sync enabled. Returns a session id; poll get_remote_session until state is 'live', then drive it with navigate, screenshot, click_element and the rest exactly as you would a local profile.".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile to run remotely"
-            },
-            "url": {
-              "type": "string",
-              "description": "Optional URL to open once the browser is up"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
-      McpTool {
-        name: "stop_remote_session".to_string(),
-        description: "Stop a remote session and settle what it cost. A session left running bills until the fleet's two-hour cap, so stop one as soon as you are done with it".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "description": "Session id returned by run_profile_remote"
-            }
-          },
-          "required": ["session_id"]
-        }),
-      },
-      // Observability. `run_profile_remote` hands back a session id and the
-      // word "provisioning"; without these an agent can only learn that a
-      // session became usable by trying to drive it and failing.
-      McpTool {
-        name: "list_remote_sessions".to_string(),
-        description: "List the remote browser sessions this account currently owns, with their live status".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {},
-          "required": []
-        }),
-      },
-      McpTool {
-        name: "get_remote_session".to_string(),
-        description: "Read one remote session's real state: provisioning, ready, live or closed, plus whether it can be driven yet".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "session_id": {
-              "type": "string",
-              "description": "Session id returned when the remote session was started"
-            }
-          },
-          "required": ["session_id"]
-        }),
-      },
-      McpTool {
-        name: "get_remote_hours_quota".to_string(),
-        description: "Read the pooled remote-hour budget. Bot runs and interactive remote sessions spend the same pool".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {},
-          "required": []
-        }),
-      },
-      // Cookie bot. Every one of these is a proxy onto Donut cloud, which owns
-      // the schedule and the browsing behaviour; the tools carry only the
-      // user's own choices.
-      McpTool {
-        name: "list_cookie_bot_schedules".to_string(),
-        description: "List profiles enrolled in the nightly cookie bot".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "scope": {
-              "type": "string",
-              "enum": ["mine", "team"],
-              "description": "Whose enrolments to list (default: mine)"
-            }
-          },
-          "required": []
-        }),
-      },
-      McpTool {
-        name: "get_cookie_bot_schedule".to_string(),
-        description: "Get one profile's cookie-bot enrolment, or null when it is not enrolled".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
-      McpTool {
-        name: "set_cookie_bot_schedule".to_string(),
-        description: "Enrol a profile in the nightly cookie bot, or replace its enrolment. The profile must have cloud sync (not end-to-end encrypted), a recorded Windows or macOS operating system, and a proxy or VPN".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile to enrol"
-            },
-            "profile_name": {
-              "type": "string",
-              "description": "Label shown in run history (default: the profile's own name)"
-            },
-            "platform": {
-              "type": "string",
-              "enum": ["windows", "macos"],
-              "description": "Must match the profile's own operating system; taken from the profile when omitted"
-            },
-            "enabled": {
-              "type": "boolean",
-              "description": "Whether the nightly run is armed"
-            },
-            "run_at_minute": {
-              "type": "integer",
-              "description": "Minutes past local midnight, 0-1439"
-            },
-            "days_mask": {
-              "type": "integer",
-              "description": "Bitmask of local weekdays, bit 0 = Monday, 1-127"
-            },
-            "timezone": {
-              "type": "string",
-              "description": "IANA zone the run time is expressed in, e.g. Europe/Berlin"
-            },
-            "preset": {
-              "type": "string",
-              "description": "Preset id from list_cookie_bot_presets"
-            },
-            "max_minutes": {
-              "type": "integer",
-              "description": "Upper bound on one run, in minutes"
-            },
-            "sites": {
-              "type": "array",
-              "items": { "type": "string" },
-              "description": "Absolute http(s) URLs to browse. The bot visits only these"
-            },
-            "jitter_seconds": {
-              "type": "integer",
-              "description": "Random spread around the run time, in seconds"
-            },
-            "acknowledge_conflict": {
-              "type": "boolean",
-              "description": "Write anyway when a teammate already enrols this profile"
-            }
-          },
-          "required": ["profile_id", "enabled", "run_at_minute", "days_mask", "timezone", "preset", "max_minutes"]
-        }),
-      },
-      McpTool {
-        name: "delete_cookie_bot_schedule".to_string(),
-        description: "Turn the cookie bot off for a profile. Safe to repeat; a run already in flight is not cancelled".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile to unenrol"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
-      McpTool {
-        name: "check_cookie_bot_conflicts".to_string(),
-        description: "Ask, without writing anything, which teammates already enrol this profile and whether a proposed time would overlap theirs".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the profile"
-            },
-            "run_at_minute": {
-              "type": "integer",
-              "description": "Proposed minutes past local midnight, 0-1439"
-            },
-            "timezone": {
-              "type": "string",
-              "description": "Proposed IANA zone"
-            },
-            "days_mask": {
-              "type": "integer",
-              "description": "Proposed weekday bitmask, bit 0 = Monday"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
-      McpTool {
-        name: "list_cookie_bot_runs".to_string(),
-        description: "List cookie-bot runs, newest first, with how many sites each visited and what it cost".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "Restrict to one profile"
-            },
-            "scope": {
-              "type": "string",
-              "enum": ["mine", "team"],
-              "description": "Whose runs to list (default: mine)"
-            },
-            "limit": {
-              "type": "integer",
-              "description": "Page size, 1-100 (default: 30)"
-            },
-            "before": {
-              "type": "string",
-              "description": "Keyset cursor from a previous page's next_before"
-            }
-          },
-          "required": []
-        }),
-      },
-      McpTool {
-        name: "run_cookie_bot_now".to_string(),
-        description: "Start a cookie-bot run immediately instead of waiting for the schedule. The profile must already be enrolled: the preset and site list live in its schedule. Requires an active Pro subscription and spends the pooled remote-hour budget".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "profile_id": {
-              "type": "string",
-              "description": "The UUID of the enrolled profile to warm"
-            },
-            "max_minutes": {
-              "type": "integer",
-              "description": "Cap this run only, overriding the schedule's own"
-            }
-          },
-          "required": ["profile_id"]
-        }),
-      },
-      McpTool {
-        name: "cancel_cookie_bot_run".to_string(),
-        description: "Stop a cookie-bot run that is still going. Idempotent: cancelling a finished run returns it unchanged".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "run_id": {
-              "type": "string",
-              "description": "Run id from list_cookie_bot_runs"
-            }
-          },
-          "required": ["run_id"]
-        }),
-      },
-      McpTool {
-        name: "list_cookie_bot_presets".to_string(),
-        description: "List the cookie-bot intensities that can be chosen, with roughly how long each takes".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {},
-          "required": []
-        }),
-      },
-      McpTool {
-        name: "get_cookie_bot_usage".to_string(),
-        description: "Per-member and per-profile cookie-bot spend for a calendar month. Reporting only".to_string(),
-        input_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "period": {
-              "type": "string",
-              "description": "Calendar month as YYYY-MM (default: the current UTC month)"
-            }
-          },
-          "required": []
-        }),
-      },
     ]
   }
 
@@ -2197,38 +1799,10 @@ impl McpServer {
     match tool_name {
       "list_profiles" => self.handle_list_profiles().await,
       "get_profile" => self.handle_get_profile(arguments).await,
-      "run_profile" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_run_profile(arguments).await
-      }
-      "kill_profile" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_kill_profile(arguments).await
-      }
-      "batch_run_profiles" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_batch_run_profiles(arguments).await
-      }
-      "batch_stop_profiles" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_batch_stop_profiles(arguments).await
-      }
+      "run_profile" => self.handle_run_profile(arguments).await,
+      "kill_profile" => self.handle_kill_profile(arguments).await,
+      "batch_run_profiles" => self.handle_batch_run_profiles(arguments).await,
+      "batch_stop_profiles" => self.handle_batch_stop_profiles(arguments).await,
       "create_profile" => self.handle_create_profile(arguments).await,
       // Profile import (free, like create_profile — importing is not automation)
       "detect_browser_profiles" => self.handle_detect_browser_profiles(arguments).await,
@@ -2264,14 +1838,7 @@ impl McpServer {
       // API and the get_profile tool, which already expose the config); only
       // editing requires a paid plan.
       "get_profile_fingerprint" => self.handle_get_profile_fingerprint(arguments).await,
-      "update_profile_fingerprint" => {
-        Self::require_capability(
-          "Fingerprint editing",
-          CLOUD_AUTH.can_use_cross_os_fingerprints().await,
-        )
-        .await?;
-        self.handle_update_profile_fingerprint(arguments).await
-      }
+      "update_profile_fingerprint" => self.handle_update_profile_fingerprint(arguments).await,
       "update_profile_proxy_bypass_rules" => {
         self
           .handle_update_profile_proxy_bypass_rules(arguments)
@@ -2298,141 +1865,22 @@ impl McpServer {
       }
       // Cookie management
       "import_profile_cookies" => self.handle_import_profile_cookies(arguments).await,
-      // Team lock tools
-      "get_team_locks" => self.handle_get_team_locks().await,
-      "get_team_lock_status" => self.handle_get_team_lock_status(arguments).await,
       // Synchronizer tools
-      "start_sync_session" => {
-        Self::require_capability(
-          "Synchronizer",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_start_sync_session(arguments).await
-      }
+      "start_sync_session" => self.handle_start_sync_session(arguments).await,
       "stop_sync_session" => self.handle_stop_sync_session(arguments).await,
       "get_sync_sessions" => self.handle_get_sync_sessions().await,
       "remove_sync_follower" => self.handle_remove_sync_follower(arguments).await,
-      // Browser interaction tools (require paid subscription)
-      "navigate" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_navigate(arguments).await
-      }
-      "screenshot" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_screenshot(arguments).await
-      }
-      "evaluate_javascript" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_evaluate_javascript(arguments).await
-      }
-      "click_element" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_click_element(arguments).await
-      }
-      "type_text" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_type_text(arguments).await
-      }
-      "get_page_content" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_get_page_content(arguments).await
-      }
-      "get_page_info" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_get_page_info(arguments).await
-      }
-      "get_interactive_elements" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_get_interactive_elements(arguments).await
-      }
-      "click_by_index" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_click_by_index(arguments).await
-      }
-      "type_by_index" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_type_by_index(arguments).await
-      }
-      // Leasing a host is the most expensive thing this server can do, so it
-      // is gated exactly like the local launch it replaces.
-      "run_profile_remote" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_run_profile_remote(arguments).await
-      }
-      // No capability gate on the stop. A lapsed plan must never be the reason
-      // an agent cannot end something that is spending hours.
-      "stop_remote_session" => Self::handle_stop_remote_session(arguments).await,
-      // Remote fleet observability. Reads only, and free: being unable to see
-      // that a session you are already paying for has become usable is not a
-      // feature worth withholding.
-      "list_remote_sessions" => Self::handle_list_remote_sessions().await,
-      "get_remote_session" => Self::handle_get_remote_session(arguments).await,
-      "get_remote_hours_quota" => Self::handle_get_remote_hours_quota().await,
-      // Cookie bot. Reading and configuring are free; only starting a run,
-      // which leases a host and spends the pooled hours, needs the plan.
-      "list_cookie_bot_schedules" => Self::handle_list_cookie_bot_schedules(arguments).await,
-      "get_cookie_bot_schedule" => Self::handle_get_cookie_bot_schedule(arguments).await,
-      "set_cookie_bot_schedule" => Self::handle_set_cookie_bot_schedule(arguments).await,
-      "delete_cookie_bot_schedule" => Self::handle_delete_cookie_bot_schedule(arguments).await,
-      "check_cookie_bot_conflicts" => Self::handle_check_cookie_bot_conflicts(arguments).await,
-      "list_cookie_bot_runs" => Self::handle_list_cookie_bot_runs(arguments).await,
-      "run_cookie_bot_now" => {
-        // The Cookie Bot, NOT browser automation. Solo pays for the bot and has
-        // no automation; gating this on automation refused a Solo customer the
-        // feature their plan is sold on while their scheduled runs kept firing.
-        Self::require_capability("Cookie Bot", CLOUD_AUTH.can_use_cookie_bot().await).await?;
-        Self::handle_run_cookie_bot_now(arguments).await
-      }
-      // No capability gate on the cancel. A lapsed plan must never be the
-      // reason an agent cannot stop something that is spending hours.
-      "cancel_cookie_bot_run" => Self::handle_cancel_cookie_bot_run(arguments).await,
-      "list_cookie_bot_presets" => Self::handle_list_cookie_bot_presets().await,
-      "get_cookie_bot_usage" => Self::handle_get_cookie_bot_usage(arguments).await,
+      // Browser interaction tools.
+      "navigate" => self.handle_navigate(arguments).await,
+      "screenshot" => self.handle_screenshot(arguments).await,
+      "evaluate_javascript" => self.handle_evaluate_javascript(arguments).await,
+      "click_element" => self.handle_click_element(arguments).await,
+      "type_text" => self.handle_type_text(arguments).await,
+      "get_page_content" => self.handle_get_page_content(arguments).await,
+      "get_page_info" => self.handle_get_page_info(arguments).await,
+      "get_interactive_elements" => self.handle_get_interactive_elements(arguments).await,
+      "click_by_index" => self.handle_click_by_index(arguments).await,
+      "type_by_index" => self.handle_type_by_index(arguments).await,
       _ => Err(McpError {
         code: -32602,
         message: format!("Unknown tool: {tool_name}"),
@@ -2507,13 +1955,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    // Launching profiles programmatically requires the automation capability.
-    Self::require_capability(
-      "Launching a profile",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -2552,14 +1993,6 @@ impl McpServer {
       });
     }
 
-    // Team lock check
-    crate::team_lock::acquire_team_lock_if_needed(profile)
-      .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e,
-      })?;
-
     // Get app handle to launch
     let inner = self.inner.lock().await;
     let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
@@ -2593,13 +2026,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    // Stopping profiles programmatically requires the automation capability.
-    Self::require_capability(
-      "Killing a profile",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -2648,8 +2074,6 @@ impl McpServer {
         message: format!("Failed to kill browser: {e}"),
       })?;
 
-    crate::team_lock::release_team_lock_if_needed(profile).await;
-
     Ok(serde_json::json!({
       "content": [{
         "type": "text",
@@ -2662,12 +2086,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    Self::require_capability(
-      "Batch launching profiles",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_ids: Vec<String> = arguments
       .get("profile_ids")
       .and_then(|v| v.as_array())
@@ -2721,10 +2139,6 @@ impl McpServer {
         ));
         continue;
       }
-      if let Err(e) = crate::team_lock::acquire_team_lock_if_needed(profile).await {
-        lines.push(format!("{profile_id}: {e}"));
-        continue;
-      }
       match crate::browser_runner::launch_browser_profile_impl(
         app_handle.clone(),
         profile.clone(),
@@ -2753,12 +2167,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    Self::require_capability(
-      "Batch stopping profiles",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_ids: Vec<String> = arguments
       .get("profile_ids")
       .and_then(|v| v.as_array())
@@ -2803,7 +2211,6 @@ impl McpServer {
         .await
       {
         Ok(_) => {
-          crate::team_lock::release_team_lock_if_needed(profile).await;
           stopped += 1;
           lines.push(format!("{}: stopped", profile.name));
         }
@@ -3149,48 +2556,22 @@ impl McpServer {
       });
     }
 
-    // "Running" has to mean "drivable", not "has a process on this machine".
-    // A profile open on the leased fleet has no local process, and answering
-    // `is_running: false` for it tells an agent not to bother calling the very
-    // tools that would have worked.
+    // "Running" means the browser can be driven; in a local-only build that is
+    // simply whether a process is recorded for this profile.
     let is_running_locally = profile.process_id.is_some();
-    let remote_session = if is_running_locally {
-      None
-    } else {
-      crate::remote_session::live_session_for_profile(profile_id).await
-    };
-
-    let location = match (is_running_locally, &remote_session) {
-      (true, _) => "local",
-      (false, Some(_)) => "remote",
-      (false, None) => "stopped",
-    };
-
-    // Whether a LOCAL launch would be refused, and why. An agent that reads
-    // `location: "stopped"` and calls `run_profile` on a profile whose finished
-    // remote session has not been pulled back would get a bare 409 with nothing
-    // to act on; worse, before the gate existed it would have got a browser and
-    // silently destroyed the session's work.
-    let handoff = crate::remote_handoff::state_for(profile_id);
-    let can_launch_locally = handoff.is_none() && !is_running_locally;
+    let location = if is_running_locally { "local" } else { "stopped" };
 
     Ok(serde_json::json!({
       "content": [{
         "type": "text",
         "text": serde_json::json!({
           "profile_id": profile_id,
-          "is_running": location != "stopped",
+          "is_running": is_running_locally,
           "is_running_locally": is_running_locally,
           "location": location,
-          "remote_session_id": remote_session.map(|session| session.session_id),
-          "can_launch_locally": can_launch_locally,
-          "local_launch_blocked_by": match handoff {
-            Some(crate::remote_handoff::HandoffState::Running) => Some("remote_session_running"),
-            Some(crate::remote_handoff::HandoffState::PendingSync) => {
-              Some("remote_session_changes_downloading")
-            }
-            None => None,
-          },
+          "remote_session_id": serde_json::Value::Null,
+          "can_launch_locally": !is_running_locally,
+          "local_launch_blocked_by": serde_json::Value::Null,
         }).to_string()
       }]
     }))
@@ -4252,13 +3633,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.can_use_cross_os_fingerprints().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Fingerprint editing requires a plan that includes it".to_string(),
-      });
-    }
-
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -4272,18 +3646,6 @@ impl McpServer {
     let randomize = arguments
       .get("randomize_fingerprint_on_launch")
       .and_then(|v| v.as_bool());
-
-    if let Some(os_val) = os {
-      if !CLOUD_AUTH.is_fingerprint_os_allowed(Some(os_val)).await {
-        return Err(McpError {
-          code: -32000,
-          message: format!(
-            "OS spoofing to '{}' requires an active Pro subscription",
-            os_val
-          ),
-        });
-      }
-    }
 
     let profiles = ProfileManager::instance()
       .list_profiles()
@@ -4446,12 +3808,6 @@ impl McpServer {
   }
 
   async fn handle_list_extensions(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let extensions = mgr.list_extensions().map_err(|e| McpError {
       code: -32000,
@@ -4461,12 +3817,6 @@ impl McpServer {
   }
 
   async fn handle_list_extension_groups(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let groups = mgr.list_groups().map_err(|e| McpError {
       code: -32000,
@@ -4479,12 +3829,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let path = arguments
       .get("path")
       .and_then(|v| v.as_str())
@@ -4515,12 +3859,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let extension_id = arguments
       .get("extension_id")
       .and_then(|v| v.as_str())
@@ -4561,12 +3899,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let name = arguments
       .get("name")
       .and_then(|v| v.as_str())
@@ -4586,12 +3918,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let group_id = arguments
       .get("group_id")
       .and_then(|v| v.as_str())
@@ -4626,12 +3952,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let group = mgr
@@ -4647,12 +3967,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let group = mgr
@@ -4686,12 +4000,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let extension_id = arguments
       .get("extension_id")
       .and_then(|v| v.as_str())
@@ -4713,12 +4021,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let group_id = arguments
       .get("group_id")
       .and_then(|v| v.as_str())
@@ -4743,12 +4045,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-      });
-    }
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -4799,50 +4095,6 @@ impl McpServer {
         message: format!("Failed to assign extension group: {e}"),
       })?;
     Ok(serde_json::to_value(profile).unwrap())
-  }
-
-  async fn handle_get_team_locks(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.is_on_team_plan().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Team features require an active team plan".to_string(),
-      });
-    }
-    let locks = crate::team_lock::TEAM_LOCK.get_locks().await;
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&locks).unwrap_or_default()
-      }]
-    }))
-  }
-
-  async fn handle_get_team_lock_status(
-    &self,
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.is_on_team_plan().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Team features require an active team plan".to_string(),
-      });
-    }
-    let profile_id = arguments
-      .get("profile_id")
-      .and_then(|v| v.as_str())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing profile_id".to_string(),
-      })?;
-    let lock_status = crate::team_lock::TEAM_LOCK
-      .get_lock_status(profile_id)
-      .await;
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&lock_status).unwrap_or_default()
-      }]
-    }))
   }
 
   // --- CDP utility methods for browser interaction ---
@@ -5876,405 +5128,6 @@ impl McpServer {
     }))
   }
 
-  // --- Remote fleet and cookie bot -----------------------------------------
-  //
-  // Every tool below is a proxy onto Donut cloud, which owns the schedule, the
-  // calendar arithmetic, the browsing behaviour and the pooled hour budget.
-  // Nothing here decides when a run happens or what it does. What this file
-  // DOES decide is which profiles may be offered to the bot at all.
-
-  /// Render a value as the single text block an MCP tool answers with.
-  fn json_content<T: Serialize>(value: &T) -> Result<serde_json::Value, McpError> {
-    let text = serde_json::to_string_pretty(value).map_err(|e| McpError {
-      code: -32000,
-      message: format!("Failed to encode response: {e}"),
-    })?;
-    Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
-  }
-
-  fn require_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Result<&'a str, McpError> {
-    arguments
-      .get(key)
-      .and_then(|value| value.as_str())
-      .filter(|value| !value.is_empty())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: format!("Missing {key}"),
-      })
-  }
-
-  /// Read a whole-number argument, refusing anything that would silently wrap.
-  ///
-  /// `as_u64() as u16` would turn a run time of 1440 into 1440 but 65536 into
-  /// 0, quietly scheduling a run at midnight nobody asked for.
-  fn require_u16(arguments: &serde_json::Value, key: &str) -> Result<u16, McpError> {
-    Self::optional_u16(arguments, key)?.ok_or_else(|| McpError {
-      code: -32602,
-      message: format!("Missing {key}"),
-    })
-  }
-
-  fn optional_u16(arguments: &serde_json::Value, key: &str) -> Result<Option<u16>, McpError> {
-    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
-      return Ok(None);
-    };
-    value
-      .as_u64()
-      .and_then(|raw| u16::try_from(raw).ok())
-      .map(Some)
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: format!("{key} must be a whole number between 0 and 65535"),
-      })
-  }
-
-  fn optional_u8(arguments: &serde_json::Value, key: &str) -> Result<Option<u8>, McpError> {
-    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
-      return Ok(None);
-    };
-    value
-      .as_u64()
-      .and_then(|raw| u8::try_from(raw).ok())
-      .map(Some)
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: format!("{key} must be a whole number between 0 and 255"),
-      })
-  }
-
-  fn optional_u32(arguments: &serde_json::Value, key: &str) -> Result<Option<u32>, McpError> {
-    let Some(value) = arguments.get(key).filter(|value| !value.is_null()) else {
-      return Ok(None);
-    };
-    value
-      .as_u64()
-      .and_then(|raw| u32::try_from(raw).ok())
-      .map(Some)
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: format!("{key} must be a whole number between 0 and 4294967295"),
-      })
-  }
-
-  /// A cloud failure, rendered as the `{"code":…,"params":{…}}` envelope.
-  ///
-  /// The backend's own English would be meaningless to an agent deciding what
-  /// to do next; a stable code and its parameters are something it can branch
-  /// on, and it is the same envelope the desktop and the REST API answer with.
-  fn cloud_error(err: crate::cookie_bot::CookieBotError) -> McpError {
-    McpError {
-      code: -32000,
-      message: err.to_error_json(),
-    }
-  }
-
-  /// Resolve a profile the cookie bot is allowed to touch.
-  ///
-  /// The same gate the REST surface applies, for the same reason: the bot runs
-  /// ONLY on the leased fleet, so a profile that cannot make the round trip to
-  /// a remote host and back — never synced, encrypted with a key that never
-  /// leaves this machine, no recorded OS, an OS the fleet cannot lease, or no
-  /// proxy or VPN to egress through — must never reach an enrolment, a quota
-  /// check or a leased host on ANY surface.
-  fn cookie_bot_eligible_profile(profile_id: &str) -> Result<BrowserProfile, McpError> {
-    let profiles = ProfileManager::instance()
-      .list_profiles()
-      .map_err(|e| McpError {
-        code: -32000,
-        message: format!("Failed to list profiles: {e}"),
-      })?;
-
-    let profile = profiles
-      .into_iter()
-      .find(|p| p.id.to_string() == profile_id)
-      .ok_or_else(|| McpError {
-        code: -32000,
-        message: format!("Profile not found: {profile_id}"),
-      })?;
-
-    crate::cookie_bot::bot_precondition(&profile, &crate::cookie_bot::exit_reachability(&profile))
-      .map_err(|message| McpError {
-        code: -32000,
-        message,
-      })?;
-    Ok(profile)
-  }
-
-  /// Start this profile on a host of its own operating system.
-  ///
-  /// Deliberately no `is_cross_os` guard: local `run_profile` refuses a foreign
-  /// profile because THIS machine is the wrong OS, and running it on a host of
-  /// its own OS is precisely what this exists for.
-  async fn handle_run_profile_remote(
-    &self,
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    let url = arguments
-      .get("url")
-      .and_then(|v| v.as_str())
-      .map(str::to_string);
-    let profile = self.get_wayfern_profile(profile_id)?;
-
-    // The host pulls the profile from cloud storage, so one that has never
-    // synced would launch an empty browser and push that emptiness back over
-    // the real one. Same rule the REST route applies, from the same place.
-    crate::api_server::remote_launch_precondition(&profile)
-      .await
-      .map_err(|message| McpError {
-        code: -32000,
-        message,
-      })?;
-
-    let app = {
-      let inner = self.inner.lock().await;
-      inner.app_handle.clone().ok_or_else(|| McpError {
-        code: -32000,
-        message: "MCP server not properly initialized".to_string(),
-      })?
-    };
-
-    let outcome = crate::remote_session::start_remote_session(app, &profile, url)
-      .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
-    Self::json_content(&outcome)
-  }
-
-  /// Stop a remote session and settle what it cost.
-  async fn handle_stop_remote_session(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let session_id = Self::require_str(arguments, "session_id")?;
-    let outcome = crate::remote_session::end_remote_session(session_id)
-      .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
-    Self::json_content(&outcome)
-  }
-
-  async fn handle_list_remote_sessions() -> Result<serde_json::Value, McpError> {
-    let sessions = crate::remote_session::list_remote_sessions()
-      .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
-    Self::json_content(&sessions)
-  }
-
-  async fn handle_get_remote_session(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let session_id = Self::require_str(arguments, "session_id")?;
-    let state = crate::remote_session::get_remote_session(session_id)
-      .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
-    Self::json_content(&state)
-  }
-
-  async fn handle_get_remote_hours_quota() -> Result<serde_json::Value, McpError> {
-    let quota = crate::cookie_bot::remote_hours_quota()
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&quota)
-  }
-
-  async fn handle_list_cookie_bot_schedules(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let scope = arguments.get("scope").and_then(|value| value.as_str());
-    let schedules = crate::cookie_bot::list_schedules(scope)
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&schedules)
-  }
-
-  async fn handle_get_cookie_bot_schedule(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    // Not gated on eligibility: a profile whose sync was turned off after it
-    // was enrolled must still be able to show what it is enrolled as.
-    let schedule = crate::cookie_bot::get_schedule(profile_id)
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&schedule)
-  }
-
-  async fn handle_set_cookie_bot_schedule(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    let profile = Self::cookie_bot_eligible_profile(profile_id)?;
-
-    // `bot_precondition` already proved the profile has an OS the fleet can
-    // lease. Taking the platform from the profile rather than the arguments is
-    // what stops an agent enrolling a macOS profile onto a Windows host.
-    let platform = profile
-      .resolved_os()
-      .ok_or_else(|| McpError {
-        code: -32000,
-        message: "Profile has no recorded operating system".to_string(),
-      })?
-      .to_string();
-
-    if let Some(requested) = arguments.get("platform").and_then(|v| v.as_str()) {
-      if requested != platform {
-        return Err(McpError {
-          code: -32602,
-          message: format!(
-            "platform {requested:?} does not match the profile's own operating system {platform:?}"
-          ),
-        });
-      }
-    }
-
-    let enabled = arguments
-      .get("enabled")
-      .and_then(|value| value.as_bool())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing enabled".to_string(),
-      })?;
-
-    let sites = arguments
-      .get("sites")
-      .and_then(|value| value.as_array())
-      .map(|items| {
-        items
-          .iter()
-          .filter_map(|item| item.as_str().map(str::to_string))
-          .collect::<Vec<_>>()
-      })
-      .unwrap_or_default();
-
-    let input = crate::cookie_bot::CookieBotScheduleInput {
-      profile_name: arguments
-        .get("profile_name")
-        .and_then(|value| value.as_str())
-        .map_or_else(|| profile.name.clone(), str::to_string),
-      platform,
-      enabled,
-      run_at_minute: Self::require_u16(arguments, "run_at_minute")?,
-      days_mask: Self::optional_u8(arguments, "days_mask")?.ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing days_mask".to_string(),
-      })?,
-      timezone: Self::require_str(arguments, "timezone")?.to_string(),
-      preset: Self::require_str(arguments, "preset")?.to_string(),
-      max_minutes: Self::optional_u32(arguments, "max_minutes")?.ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing max_minutes".to_string(),
-      })?,
-      sites,
-      jitter_seconds: Self::optional_u32(arguments, "jitter_seconds")?,
-      ..Default::default()
-    }
-    // Derived from the profile, never from the tool arguments: an agent must not
-    // be able to claim a profile has a proxy when it does not.
-    .with_profile_state(crate::cookie_bot::profile_state(&profile));
-
-    let acknowledge_conflict = arguments
-      .get("acknowledge_conflict")
-      .and_then(|value| value.as_bool())
-      .unwrap_or(false);
-
-    let saved = crate::cookie_bot::save_schedule(profile_id, &input, acknowledge_conflict)
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&saved)
-  }
-
-  async fn handle_delete_cookie_bot_schedule(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    // No eligibility gate: a profile that has since become ineligible is
-    // exactly the one an agent most needs to be able to unenrol.
-    let deleted = crate::cookie_bot::delete_schedule(profile_id)
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&deleted)
-  }
-
-  async fn handle_check_cookie_bot_conflicts(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    let conflicts = crate::cookie_bot::check_conflicts(
-      profile_id,
-      Self::optional_u16(arguments, "run_at_minute")?,
-      arguments.get("timezone").and_then(|value| value.as_str()),
-      Self::optional_u8(arguments, "days_mask")?,
-    )
-    .await
-    .map_err(Self::cloud_error)?;
-    Self::json_content(&conflicts)
-  }
-
-  async fn handle_list_cookie_bot_runs(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let runs = crate::cookie_bot::list_runs(
-      arguments.get("profile_id").and_then(|value| value.as_str()),
-      arguments.get("scope").and_then(|value| value.as_str()),
-      Self::optional_u32(arguments, "limit")?,
-      arguments.get("before").and_then(|value| value.as_str()),
-    )
-    .await
-    .map_err(Self::cloud_error)?;
-    Self::json_content(&runs)
-  }
-
-  async fn handle_run_cookie_bot_now(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let profile_id = Self::require_str(arguments, "profile_id")?;
-    Self::cookie_bot_eligible_profile(profile_id)?;
-
-    let started =
-      crate::cookie_bot::run_now(profile_id, Self::optional_u32(arguments, "max_minutes")?)
-        .await
-        .map_err(Self::cloud_error)?;
-    Self::json_content(&started)
-  }
-
-  async fn handle_cancel_cookie_bot_run(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let run_id = Self::require_str(arguments, "run_id")?;
-    let run = crate::cookie_bot::cancel_run(run_id)
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&run)
-  }
-
-  async fn handle_list_cookie_bot_presets() -> Result<serde_json::Value, McpError> {
-    // Ids and a rough duration only. What a preset expands to — the site
-    // ordering, the dwell model, the scroll and click programme — is the
-    // server's, and stays there.
-    let presets = crate::cookie_bot::list_presets()
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&presets)
-  }
-
-  async fn handle_get_cookie_bot_usage(
-    arguments: &serde_json::Value,
-  ) -> Result<serde_json::Value, McpError> {
-    let usage = crate::cookie_bot::team_usage(arguments.get("period").and_then(|v| v.as_str()))
-      .await
-      .map_err(Self::cloud_error)?;
-    Self::json_content(&usage)
-  }
 }
 
 lazy_static::lazy_static! {
@@ -6290,9 +5143,9 @@ mod tests {
     let server = McpServer::new();
     let tools = server.get_tools();
 
-    // Should have at least 59 tools (39 + 7 browser interaction + 13 remote
-    // fleet and cookie-bot tools)
-    assert!(tools.len() >= 59);
+    // A large local tool set: profiles, groups, proxies, VPNs, extensions,
+    // fingerprints, DNS, cookies, sync and browser interaction.
+    assert!(tools.len() >= 40);
 
     // Names are the contract an MCP client is written against, so a duplicate
     // silently shadows one of the two in dispatch and the tool that loses is
@@ -6358,9 +5211,6 @@ mod tests {
     assert!(tool_names.contains(&"assign_extension_group_to_profile"));
     // Cookie tools
     assert!(tool_names.contains(&"import_profile_cookies"));
-    // Team lock tools
-    assert!(tool_names.contains(&"get_team_locks"));
-    assert!(tool_names.contains(&"get_team_lock_status"));
     // Synchronizer tools
     assert!(tool_names.contains(&"start_sync_session"));
     assert!(tool_names.contains(&"stop_sync_session"));
@@ -6374,167 +5224,6 @@ mod tests {
     assert!(tool_names.contains(&"type_text"));
     assert!(tool_names.contains(&"get_page_content"));
     assert!(tool_names.contains(&"get_page_info"));
-    // Remote fleet: an agent must be able to start a session, see it become
-    // usable, drive it with the tools above, and stop it. Any one of those
-    // missing makes remote driving unusable from MCP alone.
-    assert!(tool_names.contains(&"run_profile_remote"));
-    assert!(tool_names.contains(&"stop_remote_session"));
-    assert!(tool_names.contains(&"list_remote_sessions"));
-    assert!(tool_names.contains(&"get_remote_session"));
-    assert!(tool_names.contains(&"get_remote_hours_quota"));
-    // Cookie bot
-    assert!(tool_names.contains(&"list_cookie_bot_schedules"));
-    assert!(tool_names.contains(&"get_cookie_bot_schedule"));
-    assert!(tool_names.contains(&"set_cookie_bot_schedule"));
-    assert!(tool_names.contains(&"delete_cookie_bot_schedule"));
-    assert!(tool_names.contains(&"check_cookie_bot_conflicts"));
-    assert!(tool_names.contains(&"list_cookie_bot_runs"));
-    assert!(tool_names.contains(&"run_cookie_bot_now"));
-    assert!(tool_names.contains(&"cancel_cookie_bot_run"));
-    assert!(tool_names.contains(&"list_cookie_bot_presets"));
-    assert!(tool_names.contains(&"get_cookie_bot_usage"));
-  }
-
-  // A tool advertised in tools/list but missing from dispatch answers "Unknown
-  // tool": the client can see it and cannot call it, and nothing else in the
-  // build notices.
-  //
-  // Asserted against the source rather than by dispatching, because half these
-  // tools take no arguments — calling them would reach Donut cloud, and a unit
-  // test that needs the network is a test that gets deleted.
-  #[test]
-  fn every_cookie_bot_tool_is_both_advertised_and_dispatchable() {
-    let server = McpServer::new();
-    let advertised: Vec<String> = server
-      .get_tools()
-      .into_iter()
-      .map(|tool| tool.name)
-      .filter(|name| name.contains("cookie_bot") || name.contains("remote"))
-      .collect();
-
-    let dispatched = include_str!("mcp_server.rs");
-    for name in &advertised {
-      assert!(
-        dispatched.contains(&format!("\"{name}\" =>")),
-        "tool is advertised but has no dispatch arm: {name}"
-      );
-    }
-    assert_eq!(
-      advertised.len(),
-      15,
-      "expected the full remote-fleet and cookie-bot set: {advertised:?}"
-    );
-  }
-
-  // The bot runs ONLY on the leased fleet. A profile that cannot be
-  // materialised on a remote host has no path to a run, and every write tool
-  // resolves its profile through this gate before the cloud is asked, so there
-  // is no argument shape that points the bot at a local-only profile.
-  #[test]
-  fn a_profile_the_bot_could_never_run_is_refused_before_the_cloud_is_asked() {
-    use crate::profile::types::SyncMode;
-
-    let eligible = || BrowserProfile {
-      id: uuid::Uuid::nil(),
-      name: "warm me".to_string(),
-      browser: "wayfern".to_string(),
-      version: "latest".to_string(),
-      sync_mode: SyncMode::Regular,
-      host_os: Some("macos".to_string()),
-      proxy_id: Some("proxy-1".to_string()),
-      ..Default::default()
-    };
-
-    assert!(crate::cookie_bot::bot_precondition(
-      &eligible(),
-      &crate::remote_exit::ExitReachability::Remote
-    )
-    .is_ok());
-
-    let mut local_only = eligible();
-    local_only.sync_mode = SyncMode::Disabled;
-    assert!(
-      crate::cookie_bot::bot_precondition(
-        &local_only,
-        &crate::remote_exit::ExitReachability::Remote
-      )
-      .is_err(),
-      "a profile with no cloud copy has nothing for a host to open"
-    );
-
-    let mut linux = eligible();
-    linux.host_os = Some("linux".to_string());
-    assert!(
-      crate::cookie_bot::bot_precondition(&linux, &crate::remote_exit::ExitReachability::Remote)
-        .is_err(),
-      "the fleet cannot lease a linux host"
-    );
-
-    let mut datacenter_egress = eligible();
-    datacenter_egress.proxy_id = None;
-    datacenter_egress.vpn_id = None;
-    assert!(
-      crate::cookie_bot::bot_precondition(
-        &datacenter_egress,
-        &crate::remote_exit::ExitReachability::None
-      )
-      .is_err(),
-      "hours of traffic from a hosting ASN damages the identity being warmed"
-    );
-  }
-
-  // Enrolment carries only the user's own scalars. A site list, a dwell range
-  // or a step programme appearing in the schema would mean the browsing model
-  // had leaked out of the server and into this AGPL client.
-  #[test]
-  fn the_bot_tools_expose_choices_not_behaviour() {
-    let server = McpServer::new();
-    let tools = server.get_tools();
-
-    let presets = tools
-      .iter()
-      .find(|tool| tool.name == "list_cookie_bot_presets")
-      .expect("list_cookie_bot_presets tool");
-    assert_eq!(
-      presets.input_schema["properties"]
-        .as_object()
-        .map(serde_json::Map::len),
-      Some(0),
-      "a preset is chosen by id; it takes no behaviour parameters"
-    );
-
-    let set = tools
-      .iter()
-      .find(|tool| tool.name == "set_cookie_bot_schedule")
-      .expect("set_cookie_bot_schedule tool");
-    let properties = set.input_schema["properties"]
-      .as_object()
-      .expect("schedule properties");
-    for leaked in [
-      "dwell",
-      "dwell_seconds",
-      "scroll",
-      "clicks",
-      "steps",
-      "actions",
-      "corpus",
-      "user_agent",
-    ] {
-      assert!(
-        !properties.contains_key(leaked),
-        "the browsing model leaked into the tool contract: {leaked}"
-      );
-    }
-
-    // `platform` is accepted but not required: this machine already knows the
-    // profile's operating system, and a supplied one that disagrees is
-    // refused rather than honoured.
-    let required = set.input_schema["required"]
-      .as_array()
-      .expect("required fields");
-    assert!(!required.iter().any(|field| field == "platform"));
-    assert!(required.iter().any(|field| field == "profile_id"));
-    assert!(required.iter().any(|field| field == "preset"));
   }
 
   #[test]
@@ -6566,71 +5255,4 @@ mod tests {
     assert!(!required.iter().any(|field| field == "port"));
   }
 
-  #[test]
-  fn rate_limit_only_classifies_browser_automation_tools() {
-    let request = |method: &str, name: Option<&str>| McpRequest {
-      jsonrpc: "2.0".to_string(),
-      id: Some(serde_json::json!(1)),
-      method: method.to_string(),
-      params: name.map(|name| serde_json::json!({ "name": name, "arguments": {} })),
-    };
-
-    for name in [
-      "run_profile",
-      "kill_profile",
-      "batch_run_profiles",
-      "batch_stop_profiles",
-      "start_sync_session",
-      "navigate",
-      "screenshot",
-      "evaluate_javascript",
-      "click_element",
-      "type_text",
-      "get_page_content",
-      "get_page_info",
-      "get_interactive_elements",
-      "click_by_index",
-      "type_by_index",
-      // Leases a remote host for up to two hours and spends the pooled
-      // remote-hour budget.
-      "run_cookie_bot_now",
-      "run_profile_remote",
-      // Reaches the fleet, like the remote-session stop it mirrors.
-      "cancel_cookie_bot_run",
-      "stop_remote_session",
-    ] {
-      assert!(
-        McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
-        "automation tool was not limited: {name}"
-      );
-    }
-
-    for name in [
-      "list_profiles",
-      // Configuration, not automation: one row in Donut cloud, no hardware
-      // leased. Metering it would throttle an agent enrolling a fleet of
-      // profiles, while the budget that guards the hardware is spent per run.
-      "set_cookie_bot_schedule",
-      "delete_cookie_bot_schedule",
-      "list_cookie_bot_schedules",
-      "get_cookie_bot_schedule",
-      "check_cookie_bot_conflicts",
-      "list_cookie_bot_runs",
-      "list_cookie_bot_presets",
-      "get_cookie_bot_usage",
-      "get_remote_hours_quota",
-      "list_remote_sessions",
-      "get_remote_session",
-    ] {
-      assert!(
-        !McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
-        "free or non-leasing tool was limited: {name}"
-      );
-    }
-
-    assert!(!McpServer::is_automation_tool_call(&request(
-      "tools/list",
-      None
-    )));
-  }
 }

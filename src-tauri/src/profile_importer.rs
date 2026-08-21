@@ -672,22 +672,6 @@ impl ProfileImporter {
       }
     }
 
-    // Gate the paid fingerprint-OS override here rather than at each call site.
-    // `wayfern_config` is only ever consumed by this function, so a caller that
-    // forgets the check (the REST and MCP surfaces each had their own copy)
-    // would bypass the restriction with no compile error.
-    let fingerprint_os = wayfern_config.as_ref().and_then(|c| c.os.as_deref());
-    if !crate::cloud_auth::CLOUD_AUTH
-      .is_fingerprint_os_allowed(fingerprint_os)
-      .await
-    {
-      return Err(
-        serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" })
-          .to_string()
-          .into(),
-      );
-    }
-
     // A profile routes through a proxy or a VPN, never both: create_profile_with_group
     // rejects it, and at launch browser_runner resolves the proxy first and
     // silently ignores the VPN. The importer saves profiles directly, so
@@ -836,12 +820,6 @@ impl ProfileImporter {
     }
 
     let mapped = map_browser_type(browser_type);
-
-    if let Some(ref pid) = proxy_id {
-      if PROXY_MANAGER.is_cloud_or_derived(pid) || pid == crate::proxy_manager::CLOUD_PROXY_ID {
-        crate::cloud_auth::CLOUD_AUTH.sync_cloud_proxy().await;
-      }
-    }
 
     let existing_profiles = self.profile_manager.list_profiles()?;
     if existing_profiles
@@ -1158,7 +1136,6 @@ pub async fn import_browser_profiles(
   duplicate_strategy: Option<DuplicateStrategy>,
   wayfern_config: Option<WayfernConfig>,
 ) -> Result<ProfileImportBatchResult, String> {
-  // The Pro gate for fingerprint OS spoofing lives inside import_profiles.
   let importer = ProfileImporter::instance();
   importer
     .import_profiles(

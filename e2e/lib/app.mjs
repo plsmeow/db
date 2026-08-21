@@ -111,9 +111,7 @@ export class AppSession {
           {
             language: "en",
             onboarding_completed: true,
-            commercial_trial_acknowledged: true,
             window_resize_warning_dismissed: true,
-            disable_auto_updates: true,
           },
           null,
           2,

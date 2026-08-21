@@ -16,7 +16,7 @@ pub use engine::{
   get_unsynced_entity_counts, is_group_in_use_by_synced_profile, is_group_used_by_synced_profile,
   is_proxy_in_use_by_synced_profile, is_proxy_used_by_synced_profile, is_sync_configured,
   is_vpn_in_use_by_synced_profile, is_vpn_used_by_synced_profile,
-  pull_profile_after_remote_session, request_profile_sync, rollover_encryption_for_all_entities,
+  request_profile_sync, rollover_encryption_for_all_entities,
   set_extension_group_sync_enabled, set_extension_sync_enabled, set_group_sync_enabled,
   set_profile_sync_mode, set_proxy_sync_enabled, set_vpn_sync_enabled, sync_profile,
   trigger_sync_for_profile, ProfileSyncOutcome, SyncEngine,

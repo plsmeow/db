@@ -563,15 +563,7 @@ impl WayfernManager {
         "windows"
       });
 
-    // Include wayfern token if available (enables cross-OS fingerprinting for paid users)
-    let wayfern_token = crate::cloud_auth::CLOUD_AUTH.get_wayfern_token().await;
-    let mut refresh_params = json!({ "operatingSystem": os });
-    if let Some(ref token) = wayfern_token {
-      refresh_params
-        .as_object_mut()
-        .unwrap()
-        .insert("wayfernToken".to_string(), json!(token));
-    }
+    let refresh_params = json!({ "operatingSystem": os });
 
     let refresh_result = self
       .send_cdp_command(&ws_url, "Wayfern.refreshFingerprint", refresh_params)
@@ -886,35 +878,6 @@ impl WayfernManager {
     let profile_color = profile_color.trim().trim_start_matches('#');
     args.push(format!("--wayfern-profile-color={profile_color}"));
 
-    let mut wayfern_token = crate::cloud_auth::CLOUD_AUTH.get_wayfern_token().await;
-    // Waiting is only meaningful for a plan a token can actually be minted for.
-    // On "any active plan" this stalled every Solo launch by the full three
-    // seconds waiting for a token the backend will never issue to them.
-    if wayfern_token.is_none()
-      && crate::cloud_auth::CLOUD_AUTH
-        .is_entitled_to_wayfern_token()
-        .await
-    {
-      // Brief wait for the background token fetch — when the API is healthy
-      // the token usually lands in well under a second. If api.donutbrowser.com
-      // is unreachable we don't want to gate the whole launch on it; the
-      // browser still works without the token (cross-OS fingerprinting just
-      // won't be enabled for this session, and the next launch will pick it
-      // up once the token arrives).
-      log::info!("Wayfern token not ready for paid user, waiting briefly...");
-      for _ in 0..3 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        wayfern_token = crate::cloud_auth::CLOUD_AUTH.get_wayfern_token().await;
-        if wayfern_token.is_some() {
-          break;
-        }
-      }
-      if wayfern_token.is_none() {
-        log::warn!(
-          "Wayfern token still unavailable after wait; launching without it (api.donutbrowser.com may be unreachable)"
-        );
-      }
-    }
     if let Some(proxy) = proxy_url {
       // Map the local proxy scheme to the matching PAC directive. SOCKS5 lets
       // Chromium route UDP (QUIC/WebRTC) and resolve DNS through the proxy;
@@ -942,10 +905,6 @@ impl WayfernManager {
       .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null());
-    if let Some(ref token) = wayfern_token {
-      command.env("WAYFERN_TOKEN", token);
-      log::info!("Wayfern authorization configured for browser process");
-    }
 
     let child = command
       .spawn()
@@ -1033,14 +992,7 @@ impl WayfernManager {
         );
       }
 
-      // Include wayfern token if available (enables cross-OS fingerprinting for paid users)
-      let wayfern_token = crate::cloud_auth::CLOUD_AUTH.get_wayfern_token().await;
-      let mut fingerprint_params = fingerprint_for_cdp.clone();
-      if let Some(ref token) = wayfern_token {
-        if let Some(obj) = fingerprint_params.as_object_mut() {
-          obj.insert("wayfernToken".to_string(), json!(token));
-        }
-      }
+      let fingerprint_params = fingerprint_for_cdp.clone();
 
       for target in &page_targets {
         if let Some(ws_url) = &target.websocket_debugger_url {

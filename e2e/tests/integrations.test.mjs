@@ -792,13 +792,6 @@ test("MCP Streamable HTTP initialization, auth, discovery, calls, and isolated a
       "update_proxy",
       "get_page_content",
       "get_interactive_elements",
-      // The remote loop has to be complete from MCP alone: start a session,
-      // watch it become usable, drive it with the interaction tools above, stop
-      // it. Any one of these missing leaves an agent able to lease a host it
-      // cannot use, or unable to lease one at all.
-      "run_profile_remote",
-      "get_remote_session",
-      "stop_remote_session",
       // Extension management is only usable from an agent if importing and
       // grouping are reachable, not just listing and deleting.
       "add_extension",
@@ -919,25 +912,6 @@ test("MCP Streamable HTTP initialization, auth, discovery, calls, and isolated a
       name: "MCP Folder Extension",
     });
     assert.equal(addedExtension.response.status, 200);
-    const subscriptionGated = /subscription/i.test(
-      addedExtension.value.error?.message ?? "",
-    );
-    // The e2e build overrides the paid-plan gate whenever a Wayfern test token
-    // is present, so with one in the environment a gated answer means the
-    // override stopped working and everything below it silently stopped
-    // running.
-    assert.ok(
-      !subscriptionGated || !process.env.WAYFERN_TEST_TOKEN,
-      `the e2e paid-plan override did not apply: ${addedExtension.value.error?.message}`,
-    );
-    if (subscriptionGated) {
-      // Every extension tool is gated on an active paid plan and this session
-      // is signed out, so the call path is unreachable here. The tool list
-      // above still proves the tools are published.
-      console.warn(
-        "Skipping the MCP extension tool calls: this session has no paid entitlement",
-      );
-    } else {
       assert.equal(addedExtension.value.error, undefined);
       const stored = (await app.invoke("list_extensions")).find(
         (item) => item.name === "Donut MCP Unpacked",
@@ -990,7 +964,6 @@ test("MCP Streamable HTTP initialization, auth, discovery, calls, and isolated a
       await app.invoke("delete_extension_group", {
         groupId: extensionGroup.id,
       });
-    }
 
     const agents = await app.invoke("list_mcp_agents");
     assert.ok(agents.some((agent) => agent.id === "cursor"));
@@ -1144,7 +1117,7 @@ test("REST and MCP share the browser automation rate limit", async () => {
   );
 });
 
-test("offline cloud, update, team-lock, trial, and synchronizer contracts are deterministic", async () => {
+test("offline update and synchronizer contracts are deterministic", async () => {
   await withApp(
     "integrations-contracts",
     async (app) => {
@@ -1152,16 +1125,6 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
         app,
         "start_mcp_server",
         "WAYFERN_TERMS_REQUIRED",
-      );
-      assert.equal(await app.invoke("cloud_get_user"), null);
-      assert.equal(await app.invoke("cloud_get_proxy_usage"), null);
-      assert.ok(await app.invoke("cloud_get_wayfern_token"));
-      assert.deepEqual(await app.invoke("get_team_locks"), []);
-      assert.equal(
-        await app.invoke("get_team_lock_status", {
-          profileId: "00000000-0000-0000-0000-000000000000",
-        }),
-        null,
       );
       assert.deepEqual(await app.invoke("get_sync_sessions"), []);
       const startResult = await invokeContract(app, "start_sync_session", {
@@ -1179,26 +1142,6 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
       });
       assert.match(removeError, /not found|session/i);
 
-      assert.equal(await app.invoke("check_for_app_updates"), null);
-      assert.equal(await app.invoke("check_for_app_updates_manual"), null);
-      assert.ok(
-        await invokeContract(app, "cloud_exchange_device_code", {
-          code: "DONUT-E2E-INVALID-CODE",
-        }),
-      );
-      assert.ok(await invokeContract(app, "cloud_refresh_profile"));
-      assert.ok(await invokeContract(app, "cloud_get_countries"));
-      assert.ok(
-        await invokeContract(app, "create_cloud_location_proxy", {
-          name: "E2E unavailable cloud proxy",
-          country: "ZZ",
-          region: null,
-          city: null,
-          isp: null,
-        }),
-      );
-      assert.ok(await invokeContract(app, "cloud_refresh_wayfern_token"));
-
       assert.ok(await invokeContract(app, "trigger_manual_version_update"));
       assert.ok(
         await invokeContract(app, "clear_all_version_cache_and_refetch"),
@@ -1214,181 +1157,9 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
         }),
         [],
       );
-      const prepareError = await app.invokeError(
-        "download_and_prepare_app_update",
-        {
-          updateInfo: {
-            current_version: "0.0.0",
-            new_version: "0.0.1-e2e",
-            release_notes: "E2E invalid update contract",
-            download_url: `${process.env.DONUT_E2E_FIXTURE_URL}/invalid-update.zip`,
-            is_nightly: false,
-            published_at: "2026-01-01T00:00:00Z",
-            manual_update_required: false,
-            release_page_url: null,
-            repo_update: false,
-            checksums_url: null,
-            asset_digest: null,
-          },
-        },
-      );
-      assert.match(prepareError, /checksum|verif|Failed to download/i);
       const versionStatus = await app.invoke("get_version_update_status");
       assert.ok(versionStatus && typeof versionStatus === "object");
       assert.equal(typeof (await app.invoke("is_default_browser")), "boolean");
-
-      // Remote sessions and the cookie bot are brokered by the cloud backend.
-      // Signed out, every one of them must fail as a code the UI can
-      // translate — a raw English string from the transport would reach the
-      // user untranslated, which is what the {"code":…} convention prevents.
-      const notSignedIn = /"code":"CLOUD_NOT_SIGNED_IN"/;
-      const missingProfileId = "00000000-0000-0000-0000-0000000000ff";
-      assert.match(await app.invokeError("list_remote_sessions"), notSignedIn);
-      assert.match(
-        await app.invokeError("get_remote_session", {
-          sessionId: "missing-e2e-session",
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("stop_remote_session", {
-          sessionId: "missing-e2e-session",
-        }),
-        notSignedIn,
-      );
-      // The local-launch gate. Nothing has run remotely in this session, so it
-      // is empty — but it must answer, because a UI that cannot read it shows
-      // an enabled Run button over a profile the backend will refuse.
-      const handoff = await app.invoke("get_remote_handoff_states");
-      assert.ok(
-        handoff && typeof handoff === "object" && !Array.isArray(handoff),
-        "the handoff gate must answer with a profile-keyed object",
-      );
-      assert.equal(Object.keys(handoff).length, 0);
-
-      // The transition stream is what the desktop uses instead of polling, so
-      // its subscriber has to start, report itself, and stop on demand. Both
-      // calls are repeated: a second start must not open a second socket, and
-      // a second stop must not fail.
-      assert.equal(await app.invoke("get_remote_session_events_status"), false);
-      await app.invoke("start_remote_session_events");
-      assert.equal(await app.invoke("get_remote_session_events_status"), true);
-      await app.invoke("start_remote_session_events");
-      assert.equal(await app.invoke("get_remote_session_events_status"), true);
-      await app.invoke("stop_remote_session_events");
-      assert.equal(await app.invoke("get_remote_session_events_status"), false);
-      await app.invoke("stop_remote_session_events");
-      assert.equal(await app.invoke("get_remote_session_events_status"), false);
-
-      assert.match(
-        await app.invokeError("get_cookie_bot_schedules", { scope: "mine" }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("get_cookie_bot_schedule", {
-          profileId: missingProfileId,
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("delete_cookie_bot_schedule", {
-          profileId: missingProfileId,
-        }),
-        notSignedIn,
-      );
-      // Saved site lists are cloud-backed like the schedules above, so they
-      // must refuse the same way rather than appearing to work offline.
-      assert.match(
-        await app.invokeError("get_cookie_bot_user_templates", {}),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("create_cookie_bot_user_template", {
-          name: "e2e list",
-          sites: ["example.com"],
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("update_cookie_bot_user_template", {
-          id: "00000000-0000-0000-0000-000000000000",
-          name: "renamed",
-          sites: null,
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("delete_cookie_bot_user_template", {
-          id: "00000000-0000-0000-0000-000000000000",
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("check_cookie_bot_conflicts", {
-          profileId: missingProfileId,
-          runAtMinute: 120,
-          daysMask: 127,
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("get_cookie_bot_runs", { limit: 10 }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("cancel_cookie_bot_run", {
-          runId: "missing-e2e-run",
-        }),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("get_cookie_bot_presets"),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("get_remote_hours_quota"),
-        notSignedIn,
-      );
-      assert.match(
-        await app.invokeError("get_cookie_bot_usage", { period: "2026-01" }),
-        notSignedIn,
-      );
-
-      // Enrolling and running act on a profile this machine holds: both are
-      // refused before any network call when it does not exist, so a bad id
-      // can never reach a leased host or an hour of the pooled budget.
-      assert.match(
-        await app.invokeError("save_cookie_bot_schedule", {
-          profileId: missingProfileId,
-          schedule: {
-            profile_name: "E2E missing profile",
-            platform: "windows",
-            enabled: true,
-            run_at_minute: 120,
-            days_mask: 127,
-            timezone: "UTC",
-            preset: "balanced",
-            max_minutes: 60,
-            sites: ["https://example.com"],
-          },
-          acknowledgeConflict: false,
-        }),
-        /"code":"PROFILE_NOT_FOUND"/,
-      );
-      assert.match(
-        await app.invokeError("run_cookie_bot_now", {
-          profileId: missingProfileId,
-          maxMinutes: 30,
-        }),
-        /"code":"PROFILE_NOT_FOUND"/,
-      );
-
-      const trial = await app.invoke("get_commercial_trial_status");
-      assert.ok(trial && typeof trial === "object");
-      await app.invoke("acknowledge_trial_expiration");
-      assert.equal(await app.invoke("has_acknowledged_trial_expiration"), true);
-      await app.invoke("cloud_logout");
-      assert.equal(await app.invoke("cloud_get_user"), null);
     },
     { wayfernTermsAccepted: false },
   );

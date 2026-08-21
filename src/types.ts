@@ -1,6 +1,3 @@
-import type { CookieBotSchedule } from "@/lib/cookie-bot";
-import type { RemoteSessionState } from "@/lib/remote-sessions";
-
 export interface ProxySettings {
   proxy_type: string;
   host: string;
@@ -86,133 +83,6 @@ export type SyncStatus = "Disabled" | "Syncing" | "Synced" | "Error";
 export interface SyncSettings {
   sync_server_url?: string;
   sync_token?: string;
-}
-
-/**
- * Capability/limit set derived from the plan by the backend. Features are gated
- * on these flags instead of a single "is paid?" check, so a plan like "solo"
- * (cloud backup + nightly cookie bot, no automation, no fingerprint editing, no
- * hands-on remote session) is just data. Mirrors
- * `apps/backend/src/plans/entitlements.ts`. Resolve via `getEntitlements()` —
- * the desktop populates it, but it stays optional for safety on older state.
- */
-export interface Entitlements {
-  active: boolean;
-  browserAutomation: boolean;
-  crossOsFingerprints: boolean;
-  cloudBackup: boolean;
-  teamCollaboration: boolean;
-  /** Overnight profile warming on a leased remote host. */
-  cookieBot: boolean;
-  /**
-   * May open a HANDS-ON remote session. Not implied by `cookieBot` or by a
-   * non-zero `remoteBrowserHours`: solo funds a nightly bot out of its hours and
-   * may not drive a remote browser itself, so any UI offering interactive remote
-   * control must read this flag.
-   */
-  remoteInteractive: boolean;
-  profileLimit: number;
-  requestsPerHour: number;
-  /**
-   * Per-seat monthly allowance for remote sessions. Reporting only: the
-   * spendable figure is whatever `get_remote_hours_quota` returns, because a
-   * team pools this across its seats and only the server knows the seat count.
-   */
-  remoteBrowserHours: number;
-}
-
-/**
- * What a backend older than the current release actually sends. Read it through
- * `getEntitlements()`, which fills the gaps — never off `CloudUser` directly, or
- * a paying customer's Cookie Bot silently reads `false`.
- *
- * `remoteInteractive` joins the optional set for the same reason `cookieBot`
- * did: a backend predating the solo tier omits it, and reading the absent key as
- * `false` would take interactive remote sessions away from a Pro customer whose
- * only mistake was a stale cached login.
- */
-export type ServerEntitlements = Omit<
-  Entitlements,
-  "cookieBot" | "remoteBrowserHours" | "remoteInteractive"
-> &
-  Partial<
-    Pick<Entitlements, "cookieBot" | "remoteBrowserHours" | "remoteInteractive">
-  >;
-
-export interface CloudUser {
-  id: string;
-  email: string;
-  plan: string;
-  planPeriod: string | null;
-  subscriptionStatus: string;
-  profileLimit: number;
-  cloudProfilesUsed: number;
-  proxyBandwidthLimitMb: number;
-  proxyBandwidthUsedMb: number;
-  proxyBandwidthExtraMb: number;
-  teamId?: string;
-  teamName?: string;
-  teamRole?: string;
-  // This device's position among the user's active devices (oldest = 1).
-  // Ordinal 1 / isPrimaryDevice === true is the only device that can run
-  // browser automation. Optional: older backends omit them.
-  deviceOrdinal?: number | null;
-  deviceCount?: number | null;
-  isPrimaryDevice?: boolean | null;
-  // Plan-derived capabilities. The desktop resolves this before handing CloudUser
-  // to the UI; optional to stay safe on older cached state.
-  entitlements?: ServerEntitlements;
-}
-
-/**
- * Cookie Bot and remote-session wire types. Defined next to the transport that
- * owns them (`src/lib/cookie-bot.ts`, `src/lib/remote-sessions.ts`) and
- * re-exported here so a component reads one module. Type-only, so nothing is
- * pulled into the bundle.
- */
-export type {
-  CookieBotConflict,
-  CookieBotPreset,
-  CookieBotPresetList,
-  CookieBotRun,
-  CookieBotRunPage,
-  CookieBotRunStarted,
-  CookieBotSchedule,
-  CookieBotScheduleInput,
-  CookieBotScheduleList,
-  CookieBotScheduleSaved,
-  CookieBotScope,
-  CookieBotUsage,
-  CookieBotUsageMember,
-  CookieBotUsageProfile,
-  RemoteHoursMember,
-  RemoteHoursQuota,
-} from "@/lib/cookie-bot";
-export type {
-  RemoteSessionPhase,
-  RemoteSessionSnapshot,
-  RemoteSessionState,
-} from "@/lib/remote-sessions";
-
-/** Where a profile stands with the bot, as one row of the profile table reads it. */
-export interface ProfileBotState {
-  /** The stored enrolment, or null when the profile is not enrolled. */
-  schedule: CookieBotSchedule | null;
-  /** A remote session for this profile that has not closed yet. */
-  liveSession: RemoteSessionState | null;
-}
-
-export interface ProfileLockInfo {
-  profileId: string;
-  lockedBy: string;
-  lockedByEmail: string;
-  lockedAt: string;
-  expiresAt?: string;
-}
-
-export interface CloudAuthState {
-  user: CloudUser;
-  logged_in_at: string;
 }
 
 export interface ProfileSyncStatusEvent {
@@ -352,30 +222,6 @@ export interface ProfileImportProgress {
 
 export interface BrowserReleaseTypes {
   stable?: string;
-}
-
-export interface AppUpdateInfo {
-  current_version: string;
-  new_version: string;
-  release_notes: string;
-  download_url: string;
-  is_nightly: boolean;
-  published_at: string;
-  manual_update_required: boolean;
-  release_page_url?: string;
-  repo_update: boolean;
-  /** URL of the release's SHA256SUMS.txt; downloads are verified against it. */
-  checksums_url?: string | null;
-  /** GitHub-computed digest of the chosen asset ("sha256:<hex>"). */
-  asset_digest?: string | null;
-}
-
-export interface AppUpdateProgress {
-  stage: string; // "downloading", "extracting", "installing", "completed"
-  percentage?: number;
-  speed?: string; // MB/s
-  eta?: string; // estimated time remaining
-  message: string;
 }
 
 export type WayfernOS = "windows" | "macos" | "linux" | "android" | "ios";

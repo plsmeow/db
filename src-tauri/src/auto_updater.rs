@@ -116,8 +116,7 @@ impl AutoUpdater {
   pub async fn check_for_updates_with_progress(&self, app_handle: &tauri::AppHandle) {
     log::info!("Starting auto-update check with progress...");
 
-    // Browser auto-updates are always enabled — the disable_auto_updates setting
-    // only controls app self-updates, not browser version updates.
+    // Browser auto-updates are always enabled.
 
     // Check for browser updates and trigger auto-downloads
     match self.check_for_updates().await {

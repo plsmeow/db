@@ -64,8 +64,6 @@ pub struct AppSettings {
   pub vpn_extension_warning_disabled: bool,
   #[serde(default)]
   pub onboarding_completed: bool, // First-launch onboarding has been shown/handled (one-shot)
-  #[serde(default)]
-  pub disable_auto_updates: bool,
   /// When true, the decrypted in-RAM copy of a password-protected profile is
   /// preserved between launches for faster subsequent startups. The on-disk
   /// copy is always re-encrypted regardless of this flag.
@@ -107,7 +105,6 @@ impl Default for AppSettings {
       fingerprint_gate_disabled: false,
       vpn_extension_warning_disabled: false,
       onboarding_completed: false,
-      disable_auto_updates: false,
       keep_decrypted_profiles_in_ram: false,
     }
   }
@@ -954,19 +951,7 @@ pub async fn save_table_sorting_settings(sorting: TableSortingSettings) -> Resul
 
 #[tauri::command]
 pub async fn get_sync_settings(app_handle: tauri::AppHandle) -> Result<SyncSettings, String> {
-  // Cloud auth takes priority over self-hosted settings
-  if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
-    let sync_token = crate::cloud_auth::CLOUD_AUTH
-      .get_or_refresh_sync_token()
-      .await
-      .map_err(|e| format!("Failed to get cloud sync token: {e}"))?;
-    return Ok(SyncSettings {
-      sync_server_url: Some(crate::cloud_auth::CLOUD_SYNC_URL.to_string()),
-      sync_token,
-    });
-  }
-
-  // Fall back to self-hosted settings
+  // Load self-hosted sync settings
   let manager = SettingsManager::instance();
   let mut sync_settings = manager
     .get_sync_settings()
@@ -986,17 +971,6 @@ pub async fn save_sync_settings(
   sync_server_url: Option<String>,
   sync_token: Option<String>,
 ) -> Result<SyncSettings, String> {
-  // Cloud login and self-hosted sync share the same sync engine and a
-  // profile can't be sync'd to two backends at once. Block any *write*
-  // (non-null URL or token) while the user is signed into their cloud
-  // account — the clearing path (both `None`) is always allowed so logged-
-  // in users can wipe a stale self-hosted config that pre-dates their
-  // sign-in.
-  let is_setting_self_hosted = sync_server_url.is_some() || sync_token.is_some();
-  if is_setting_self_hosted && crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
-    return Err(serde_json::json!({ "code": "SELF_HOSTED_REQUIRES_LOGOUT" }).to_string());
-  }
-
   let manager = SettingsManager::instance();
 
   manager
@@ -1019,6 +993,42 @@ pub async fn save_sync_settings(
     sync_server_url,
     sync_token,
   })
+}
+
+#[tauri::command]
+pub async fn restart_sync_service(app_handle: tauri::AppHandle) -> Result<(), String> {
+  use std::sync::Arc;
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    scheduler.stop();
+  }
+  let app_handle_sync = app_handle.clone();
+  tauri::async_runtime::spawn(async move {
+    let mut subscription_manager = crate::sync::SubscriptionManager::new();
+    let work_rx = subscription_manager.take_work_receiver();
+    if let Err(e) = subscription_manager.start(app_handle_sync.clone()).await {
+      log::warn!("Failed to start sync subscription: {e}");
+      return;
+    }
+    if let Some(work_rx) = work_rx {
+      let scheduler = Arc::new(crate::sync::SyncScheduler::new());
+      crate::sync::set_global_scheduler(scheduler.clone());
+      scheduler.sync_all_enabled_profiles(&app_handle_sync).await;
+      match crate::sync::SyncEngine::create_from_settings(&app_handle_sync).await {
+        Ok(engine) => {
+          if let Err(e) = engine.check_for_missing_synced_profiles(&app_handle_sync).await {
+            log::warn!("Failed to check for missing profiles: {}", e);
+          }
+          if let Err(e) = engine.check_for_missing_synced_entities(&app_handle_sync).await {
+            log::warn!("Failed to check for missing entities: {}", e);
+          }
+        }
+        Err(e) => { log::warn!("Sync not configured, skipping missing profile check: {}", e); }
+      }
+      scheduler.clone().start(app_handle_sync.clone(), work_rx).await;
+      log::info!("Sync scheduler restarted");
+    }
+  });
+  Ok(())
 }
 
 #[tauri::command]
@@ -1106,7 +1116,7 @@ pub fn get_system_info() -> SystemInfo {
   };
 
   SystemInfo {
-    app_version: crate::app_auto_updater::AppAutoUpdater::get_current_version(),
+    app_version: env!("BUILD_VERSION").to_string(),
     os: os.to_string(),
     arch: arch.to_string(),
     portable: crate::app_dirs::is_portable(),
@@ -1203,7 +1213,6 @@ mod tests {
       fingerprint_gate_disabled: false,
       vpn_extension_warning_disabled: false,
       onboarding_completed: false,
-      disable_auto_updates: false,
       keep_decrypted_profiles_in_ram: false,
     };
 

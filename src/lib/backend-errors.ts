@@ -19,7 +19,6 @@ export type BackendErrorCode =
   | "INVALID_LAUNCH_HOOK_URL"
   | "COOKIE_DB_LOCKED"
   | "COOKIE_DB_UNAVAILABLE"
-  | "SELF_HOSTED_REQUIRES_LOGOUT"
   | "PROXY_NOT_FOUND"
   | "GROUP_NOT_FOUND"
   | "GROUP_ALREADY_EXISTS"
@@ -37,12 +36,11 @@ export type BackendErrorCode =
   | "EXTENSION_PATH_HAS_COMMA"
   | "EXTENSION_LINK_REQUIRES_DIRECTORY"
   | "EXTENSION_LINKED_CANNOT_SYNC"
-  | "CANNOT_MODIFY_CLOUD_MANAGED_PROXY"
   | "SYNC_LOCKED_BY_PROFILE"
   | "SYNC_NOT_CONFIGURED"
-  | "FINGERPRINT_REQUIRES_PRO"
   | "PROXY_NOT_WORKING"
   | "PROXY_PAYMENT_REQUIRED"
+  | "CANNOT_MODIFY_CLOUD_MANAGED_PROXY"
   | "VPN_NOT_WORKING"
   | "CAMOUFOX_IMPORT_DEPRECATED"
   | "PROXY_SIDECAR_VERSION_MISMATCH"
@@ -78,55 +76,6 @@ export type BackendErrorCode =
   | "XRAY_UNAVAILABLE"
   | "XRAY_UNSUPPORTED_OS"
   | "XRAY_START_FAILED"
-  | "CLOUD_NOT_SIGNED_IN"
-  | "CLOUD_UNREACHABLE"
-  | "CLOUD_REQUEST_FAILED"
-  | "REMOTE_RATE_LIMITED"
-  | "REMOTE_NO_CAPACITY"
-  | "REMOTE_NOT_ENTITLED"
-  | "REMOTE_INTERACTIVE_NOT_ENTITLED"
-  // The profile's exit only resolves on this computer, so a leased host cannot
-  // use it. Its own code rather than the Cookie Bot's twin: the two refusals
-  // name different features, and a user told their "Cookie Bot" needs a public
-  // proxy while they were opening a browser by hand cannot act on that.
-  | "REMOTE_REQUIRES_REMOTE_EXIT_NODE"
-  | "REMOTE_SESSION_REFUSED"
-  | "REMOTE_SESSION_NOT_FOUND"
-  | "REMOTE_SESSION_CONFLICT"
-  | "REMOTE_SYNC_IN_PROGRESS"
-  | "REMOTE_HOURS_EXHAUSTED"
-  | "PROFILE_RUNNING_REMOTELY"
-  | "PROFILE_REMOTE_SYNC_PENDING"
-  | "PROFILE_LOCKED_BY_MEMBER"
-  | "PROFILE_LOCKED_ELSEWHERE"
-  | "PROFILE_LOCK_UNAVAILABLE"
-  | "NOT_TEAM_MEMBER"
-  | "COOKIE_BOT_NOT_ENTITLED"
-  | "COOKIE_BOT_NOT_ENROLLED"
-  | "COOKIE_BOT_SCHEDULE_CONFLICT"
-  | "COOKIE_BOT_RUN_IN_PROGRESS"
-  | "COOKIE_BOT_RUN_NOT_FOUND"
-  | "COOKIE_BOT_INVALID_SCHEDULE"
-  | "COOKIE_BOT_INVALID_TIMEZONE"
-  | "COOKIE_BOT_INVALID_PERIOD"
-  | "COOKIE_BOT_SITE_LIMIT"
-  | "COOKIE_BOT_REQUIRES_CLOUD_SYNC"
-  | "COOKIE_BOT_ENCRYPTED_SYNC_UNSUPPORTED"
-  | "COOKIE_BOT_UNKNOWN_PLATFORM"
-  | "COOKIE_BOT_UNSUPPORTED_PLATFORM"
-  | "COOKIE_BOT_REQUIRES_EXIT_NODE"
-  // The profile HAS an exit, but only this machine can reach it (127.0.0.1, a
-  // LAN address, a `.local` name). Its own code because the fix is different:
-  // "attach a proxy" is unactionable advice for someone whose proxy is plainly
-  // attached.
-  | "COOKIE_BOT_REQUIRES_REMOTE_EXIT_NODE"
-  // The server's own names for two refusals it throws from `putSchedule`,
-  // `updateProfileState` and `runNow`. `COOKIE_BOT_REQUIRES_PROXY` is the
-  // server-side twin of the local `COOKIE_BOT_REQUIRES_EXIT_NODE` precondition;
-  // without a case here the single most important refusal in the feature
-  // rendered as the raw machine identifier.
-  | "COOKIE_BOT_REQUIRES_PROXY"
-  | "COOKIE_BOT_TOUCH_FINGERPRINT_UNSUPPORTED"
   | "FINGERPRINT_EXIT_MISMATCH"
   | "LAUNCH_CONSENT_EXPIRED"
   | "VPN_WORKER_START_FAILED"
@@ -207,8 +156,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.cookieDbLocked");
     case "COOKIE_DB_UNAVAILABLE":
       return t("backendErrors.cookieDbUnavailable");
-    case "SELF_HOSTED_REQUIRES_LOGOUT":
-      return t("backendErrors.selfHostedRequiresLogout");
     case "PROXY_NOT_FOUND":
       return t("backendErrors.proxyNotFound");
     case "GROUP_NOT_FOUND":
@@ -246,18 +193,16 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.extensionLinkRequiresDirectory");
     case "EXTENSION_LINKED_CANNOT_SYNC":
       return t("backendErrors.extensionLinkedCannotSync");
-    case "CANNOT_MODIFY_CLOUD_MANAGED_PROXY":
-      return t("backendErrors.cannotModifyCloudManagedProxy");
     case "SYNC_LOCKED_BY_PROFILE":
       return t("backendErrors.syncLockedByProfile");
     case "SYNC_NOT_CONFIGURED":
       return t("backendErrors.syncNotConfigured");
-    case "FINGERPRINT_REQUIRES_PRO":
-      return t("backendErrors.fingerprintRequiresPro");
     case "PROXY_NOT_WORKING":
       return t("backendErrors.proxyNotWorking");
     case "PROXY_PAYMENT_REQUIRED":
       return t("backendErrors.proxyPaymentRequired");
+    case "CANNOT_MODIFY_CLOUD_MANAGED_PROXY":
+      return t("backendErrors.cannotModifyCloudManagedProxy");
     case "VPN_NOT_WORKING":
       return t("backendErrors.vpnNotWorking");
     case "CAMOUFOX_IMPORT_DEPRECATED":
@@ -371,102 +316,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.xrayStartFailed");
     case "CLEAR_ON_CLOSE_UNAVAILABLE":
       return t("backendErrors.clearOnCloseUnavailable");
-    case "CLOUD_NOT_SIGNED_IN":
-      return t("backendErrors.cloudNotSignedIn");
-    case "CLOUD_UNREACHABLE":
-      return t("backendErrors.cloudUnreachable");
-    case "CLOUD_REQUEST_FAILED":
-      return t("backendErrors.cloudRequestFailed");
-    case "REMOTE_RATE_LIMITED":
-      return t("backendErrors.remoteRateLimited");
-    case "REMOTE_NO_CAPACITY":
-      return t("backendErrors.remoteNoCapacity");
-    case "REMOTE_NOT_ENTITLED":
-      return t("backendErrors.remoteNotEntitled");
-    // Distinct from the above: the plan HAS remote hours, it just may not spend
-    // them by hand (solo funds a nightly Cookie Bot only). Telling such a user
-    // "your plan does not include remote execution" while their bot visibly
-    // runs every night is the confusing case this code exists to avoid.
-    case "REMOTE_INTERACTIVE_NOT_ENTITLED":
-      return t("backendErrors.remoteInteractiveNotEntitled");
-    case "REMOTE_REQUIRES_REMOTE_EXIT_NODE":
-      return t("backendErrors.remoteRequiresRemoteExitNode");
-    case "REMOTE_SESSION_REFUSED":
-      return t("backendErrors.remoteSessionRefused");
-    case "REMOTE_SESSION_NOT_FOUND":
-      return t("backendErrors.remoteSessionNotFound");
-    case "REMOTE_SESSION_CONFLICT":
-      return t("backendErrors.remoteSessionConflict");
-    case "REMOTE_SYNC_IN_PROGRESS":
-      return t("backendErrors.remoteSyncInProgress");
-    case "REMOTE_HOURS_EXHAUSTED":
-      return t("backendErrors.remoteHoursExhausted", {
-        granted: parsed.params?.granted ?? "0",
-        used: parsed.params?.used ?? "0",
-      });
-    case "PROFILE_RUNNING_REMOTELY":
-      return t("backendErrors.profileRunningRemotely");
-    case "PROFILE_REMOTE_SYNC_PENDING":
-      return t("backendErrors.profileRemoteSyncPending");
-    case "PROFILE_LOCKED_BY_MEMBER":
-      return t("backendErrors.profileLockedByMember", {
-        email: parsed.params?.email ?? "",
-      });
-    case "PROFILE_LOCKED_ELSEWHERE":
-      return t("backendErrors.profileLockedElsewhere");
-    case "PROFILE_LOCK_UNAVAILABLE":
-      return t("backendErrors.profileLockUnavailable");
-    case "NOT_TEAM_MEMBER":
-      return t("backendErrors.notTeamMember");
-    case "COOKIE_BOT_NOT_ENTITLED":
-      return t("backendErrors.cookieBotNotEntitled");
-    case "COOKIE_BOT_NOT_ENROLLED":
-      return t("backendErrors.cookieBotNotEnrolled");
-    case "COOKIE_BOT_SCHEDULE_CONFLICT":
-      return t("backendErrors.cookieBotScheduleConflict", {
-        email: parsed.params?.email ?? "",
-        time: parsed.params?.time ?? "",
-      });
-    case "COOKIE_BOT_RUN_IN_PROGRESS":
-      return t("backendErrors.cookieBotRunInProgress");
-    case "COOKIE_BOT_RUN_NOT_FOUND":
-      return t("backendErrors.cookieBotRunNotFound");
-    case "COOKIE_BOT_INVALID_SCHEDULE":
-      return t("backendErrors.cookieBotInvalidSchedule");
-    case "COOKIE_BOT_INVALID_TIMEZONE":
-      return t("backendErrors.cookieBotInvalidTimezone", {
-        timezone: parsed.params?.timezone ?? "",
-      });
-    case "COOKIE_BOT_INVALID_PERIOD":
-      return t("backendErrors.cookieBotInvalidPeriod");
-    case "COOKIE_BOT_SITE_LIMIT":
-      // The server sends both bounds. Defaulting `min` to 1 was not the
-      // problem — the message never mentioned a minimum at all, so a user who
-      // submitted no sites was told about a maximum they had not reached.
-      return t("backendErrors.cookieBotSiteLimit", {
-        min: parsed.params?.min ?? "1",
-        max: parsed.params?.max ?? "40",
-      });
-    case "COOKIE_BOT_REQUIRES_CLOUD_SYNC":
-      return t("backendErrors.cookieBotRequiresCloudSync");
-    case "COOKIE_BOT_ENCRYPTED_SYNC_UNSUPPORTED":
-      return t("backendErrors.cookieBotEncryptedSyncUnsupported");
-    case "COOKIE_BOT_UNKNOWN_PLATFORM":
-      return t("backendErrors.cookieBotUnknownPlatform");
-    case "COOKIE_BOT_UNSUPPORTED_PLATFORM":
-      return t("backendErrors.cookieBotUnsupportedPlatform", {
-        platform: parsed.params?.platform ?? "",
-      });
-    case "COOKIE_BOT_REQUIRES_EXIT_NODE":
-    // One condition, two names: the desktop refuses it locally as
-    // REQUIRES_EXIT_NODE and the server refuses it as REQUIRES_PROXY. Both
-    // resolve to the one sentence a user can act on.
-    case "COOKIE_BOT_REQUIRES_PROXY":
-      return t("backendErrors.cookieBotRequiresExitNode");
-    case "COOKIE_BOT_REQUIRES_REMOTE_EXIT_NODE":
-      return t("backendErrors.cookieBotRequiresRemoteExitNode");
-    case "COOKIE_BOT_TOUCH_FINGERPRINT_UNSUPPORTED":
-      return t("backendErrors.cookieBotTouchFingerprintUnsupported");
     // The launch gate's block. The dialog renders the mismatch detail from
     // `params` itself; this string is the fallback for anywhere that only has
     // room for one sentence.

@@ -1,5 +1,4 @@
 use crate::browser::ProxySettings;
-use crate::cloud_auth::CLOUD_AUTH;
 use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
 use crate::events;
 use crate::profile::{BrowserProfile, ProfileManager};
@@ -14,13 +13,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static PROFILE_LAUNCH_LOCKS: LazyLock<
   tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
-
-/// How long a remote navigation waits for the page to settle.
-///
-/// A relayed round trip crosses two networks and the page load itself happens
-/// on hardware in another country, so this is deliberately the same budget the
-/// automation tools give a navigation rather than a loopback-sized one.
-const REMOTE_NAVIGATE_TIMEOUT_SECS: u64 = 30;
 
 async fn lock_profile_launch(profile_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
   let lock = {
@@ -95,10 +87,6 @@ impl BrowserRunner {
       None => return Ok(None),
     };
 
-    if PROXY_MANAGER.is_cloud_or_derived(proxy_id) {
-      log::info!("Refreshing cloud proxy credentials before launch for proxy {proxy_id}");
-      CLOUD_AUTH.sync_cloud_proxy().await;
-    }
     // For cloud-derived proxies, inject profile-specific sid for sticky sessions
     if let Some(pid) = profile_id {
       if PROXY_MANAGER.is_cloud_or_derived(proxy_id) {
@@ -926,61 +914,9 @@ impl BrowserRunner {
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
 
-    // "Stop this profile" has to mean the browser that is actually running, and
-    // for a profile on the leased fleet that browser is not on this machine.
-    // Without this, stopping reported success, killed nothing, and left the
-    // session running to its two-hour cap — billing the user for every minute
-    // and holding their profile lock the whole time.
-    if self.stop_remote_session_for(&app_handle, profile).await? {
-      return Ok(());
-    }
-
     self
       .kill_browser_process_unlocked(app_handle, profile)
       .await
-  }
-
-  /// Stop this profile's fleet session, if it has one. Returns whether it did.
-  ///
-  /// Guarded on there being no local process so a locally running profile never
-  /// pays for the lookup, exactly as the open-URL path is: the profile lock
-  /// makes a local and a remote browser mutually exclusive.
-  async fn stop_remote_session_for(
-    &self,
-    app_handle: &tauri::AppHandle,
-    profile: &BrowserProfile,
-  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if profile.process_id.is_some() {
-      return Ok(false);
-    }
-    let profile_id = profile.id.to_string();
-    let Some(session_id) = crate::remote_handoff::running_session_for_profile(&profile_id) else {
-      return Ok(false);
-    };
-
-    log::info!(
-      "Stopping remote session {session_id} for profile {} ({profile_id})",
-      profile.name
-    );
-    crate::remote_session::end_remote_session(&session_id)
-      .await
-      .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        // Surfaced rather than swallowed. The backend refuses to retire a
-        // session it could not stop on the fleet, so a failure here means the
-        // browser is STILL RUNNING; reporting success would tell the user their
-        // profile is free when a host is still writing to it.
-        log::warn!("Failed to stop remote session {session_id}: {e}");
-        e.to_error_json().into()
-      })?;
-
-    // The session is down and its work is in cloud storage. This is what puts
-    // the profile into "pending sync" and starts the pull, so the user is not
-    // handed back a profile directory that predates the session they just ran.
-    //
-    // The session's own profile lock is released by the backend when it retires
-    // the row; nothing is released from here, because this client never held it.
-    crate::remote_session::note_session_stopped(app_handle, &session_id);
-    Ok(true)
   }
 
   async fn kill_browser_process_unlocked(
@@ -1384,29 +1320,6 @@ impl BrowserRunner {
       .ok_or_else(|| format!("Profile '{profile_id}' not found"))?;
     let _profile_launch_guard = lock_profile_launch(&profile.id.to_string()).await;
 
-    // A profile already open on the leased fleet is driven, not launched. This
-    // sits above the cross-OS guard on purpose: a Windows profile cannot run on
-    // this Mac, which is the whole reason it is running remotely, and refusing
-    // to point it at a URL for that reason would make the remote session
-    // unusable from the one endpoint that exists to use it.
-    //
-    // Guarded on there being no local process, so a profile running here never
-    // pays for the lookup: a local launch records a pid, and the profile lock
-    // keeps a local and a remote session mutually exclusive.
-    if profile.process_id.is_none() {
-      if let Ok(target) = crate::cdp_target::resolve(&profile).await {
-        if target.is_remote() {
-          log::info!("Opening URL through {}", target.describe());
-          return crate::cdp_target::navigate(&target, &url, REMOTE_NAVIGATE_TIMEOUT_SECS)
-            .await
-            .map_err(|e| {
-              log::warn!("Failed to open a URL on the remote browser: {e}");
-              format!("Failed to open URL with profile: {e}")
-            });
-        }
-      }
-    }
-
     if profile.is_cross_os() {
       return Err(format!(
         "Cannot open URL with profile '{}': this profile was created on {} and cannot be used on a different operating system",
@@ -1414,14 +1327,6 @@ impl BrowserRunner {
         profile.host_os.as_deref().unwrap_or("another OS"),
       ));
     }
-
-    // Past this point a local browser is about to be launched, and until now
-    // this was the ONE launch path that took neither the profile lock nor any
-    // notice of the fleet. A remote session whose state could not be read (a
-    // dropped event stream plus an unreachable backend) fell straight through
-    // to a local launch on a profile a host was writing to.
-    crate::remote_handoff::ensure_local_launch_allowed(&profile.id.to_string())?;
-    let acquired_team_lock = crate::team_lock::acquire_team_lock_if_needed(&profile).await?;
 
     log::info!("Opening URL with selected profile");
 
@@ -1434,9 +1339,7 @@ impl BrowserRunner {
         "Failed to open URL with selected profile: {}",
         crate::log_redaction::text(&e.to_string())
       );
-      // This path takes the team lock too, and a blocked launch never records a
-      // process_id for the status sweep to release it from.
-      unwind_launch(&profile, acquired_team_lock).await;
+      unwind_launch(&profile).await;
       // Pass structured errors through untouched: the gate's block carries the
       // mismatch detail the dialog renders, and wrapping it in English would
       // reach the user as raw JSON.
@@ -1496,24 +1399,14 @@ impl LaunchOptions {
   }
 }
 
-/// Release the team lock a launch attempt took before it failed.
-///
-/// Until the gate existed, failing here was rare enough that leaking was merely
-/// untidy. Cancelling a blocked launch is now an ordinary outcome, and the lock
-/// renews itself on a 30s heartbeat while only ever being released via a stored
-/// `process_id` — which a launch that never spawned does not have. So a leak
-/// leaves the profile reading as locked to the whole team until the app quits.
-///
-/// `acquired` is threaded from `acquire_team_lock_if_needed` so this releases
-/// only what this call took, never a lock a REST handler up the stack owns.
+/// Clear the transient launch state a launch attempt set before it failed.
 ///
 /// Several of these error paths are reachable while a browser for the profile
 /// is genuinely still running — `PROFILE_RUNNING`, or a failure to open a URL
-/// in an existing window. That browser owns the lock and the running mark, so
-/// releasing either would strand it: the team would see the profile as free
-/// while someone is typing in it, and `mark_profile_stopped` would queue a sync
-/// of a profile directory being written to. Hence the liveness check.
-async fn unwind_launch(profile: &BrowserProfile, acquired_team_lock: bool) {
+/// in an existing window. That browser owns the running mark, so clearing it
+/// would strand it: `mark_profile_stopped` would queue a sync of a profile
+/// directory being written to. Hence the liveness check.
+async fn unwind_launch(profile: &BrowserProfile) {
   if browser_is_running_for(&profile.id.to_string()) {
     log::debug!(
       "Not unwinding launch state for {}: a browser is still running for it",
@@ -1522,10 +1415,7 @@ async fn unwind_launch(profile: &BrowserProfile, acquired_team_lock: bool) {
     return;
   }
 
-  if acquired_team_lock {
-    crate::team_lock::release_team_lock_if_needed(profile).await;
-  }
-  // Otherwise this mark sticks for the rest of the session and silently defers
+  // This mark otherwise sticks for the rest of the session and silently defers
   // every sync of the profile. Safe here precisely because nothing is running.
   if let Some(scheduler) = crate::sync::get_global_scheduler() {
     scheduler
@@ -1580,15 +1470,6 @@ pub async fn launch_browser_profile_impl(
     ));
   }
 
-  // Refuse a launch that would run over work a remote session has not handed
-  // back yet. Checked before the profile lock because it answers without a
-  // round trip and because it stays true after the session's lock is released:
-  // the lock protects the browser, this protects the bytes it wrote.
-  crate::remote_handoff::ensure_local_launch_allowed(&profile.id.to_string())?;
-
-  // Team lock check: if profile is sync-enabled and user is on a team, acquire lock
-  let acquired_team_lock = crate::team_lock::acquire_team_lock_if_needed(&profile).await?;
-
   // Notify sync scheduler that profile is now running and queue sync for when it stops
   if let Some(scheduler) = crate::sync::get_global_scheduler() {
     let pid = profile.id.to_string();
@@ -1611,7 +1492,7 @@ pub async fn launch_browser_profile_impl(
       .find(|p| p.id == profile.id)
       .unwrap_or_else(|| profile.clone()),
     Err(e) => {
-      unwind_launch(&profile, acquired_team_lock).await;
+      unwind_launch(&profile).await;
       return Err(e);
     }
   };
@@ -1635,7 +1516,7 @@ pub async fn launch_browser_profile_impl(
     {
       Ok(running) => running,
       Err(error) => {
-        unwind_launch(&profile, acquired_team_lock).await;
+        unwind_launch(&profile).await;
         return Err(crate::wrap_backend_error(
           error,
           "Failed to check browser status before launch",
@@ -1643,7 +1524,7 @@ pub async fn launch_browser_profile_impl(
       }
     };
     if already_running {
-      unwind_launch(&profile, acquired_team_lock).await;
+      unwind_launch(&profile).await;
       return Err(crate::backend_error("PROFILE_RUNNING"));
     }
   }
@@ -1695,7 +1576,7 @@ pub async fn launch_browser_profile_impl(
         log::warn!("Warning: Failed to emit profile running changed event: {e}");
       }
 
-      unwind_launch(&profile, acquired_team_lock).await;
+      unwind_launch(&profile).await;
 
       // Check if this is an architecture compatibility issue
       if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
@@ -1755,9 +1636,6 @@ pub async fn kill_browser_profile(
         profile.name,
         profile.id
       );
-
-      // Release team lock if applicable
-      crate::team_lock::release_team_lock_if_needed(&profile).await;
 
       // Notify sync scheduler that profile stopped (sync was queued at launch)
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
